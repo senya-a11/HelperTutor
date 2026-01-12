@@ -6,9 +6,9 @@ from typing import Optional
 from dotenv import load_dotenv
 from pytz import timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import psycopg2
-from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -22,9 +22,7 @@ load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TUTOR_ID = int(os.getenv('TUTOR_ID', 0))
 TIMEZONE = os.getenv('TIMEZONE', 'Europe/Moscow')
-
-# PostgreSQL connection string для Render.com
-DATABASE_URL = os.getenv('DATABASE_URL')  # Render предоставляет эту переменную
+DATABASE_URL = os.getenv('DATABASE_URL')
 
 # Состояния для ConversationHandler
 WAITING_HW_TEXT, WAITING_HW_DEADLINE, WAITING_SCHEDULE_TIME, WAITING_SCHEDULE_TOPIC = range(4)
@@ -36,157 +34,140 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Пул соединений PostgreSQL
-connection_pool = None
+# Пул соединений PostgreSQL (async)
+db_pool = None
 
 
-# ====================== БАЗА ДАННЫХ POSTGRESQL ======================
-def init_db():
-    """Инициализация базы данных PostgreSQL"""
-    global connection_pool
+# ====================== БАЗА ДАННЫХ POSTGRESQL (psycopg3) ======================
+async def init_db():
+    """Инициализация базы данных PostgreSQL с psycopg3"""
+    global db_pool
 
     try:
-        # Создаем пул соединений
-        connection_pool = psycopg2.pool.SimpleConnectionPool(
-            1, 20,  # min, max connections
-            DATABASE_URL,
-            sslmode='require'  # Для Render.com обязательно
+        # Создаем async пул соединений
+        db_pool = AsyncConnectionPool(
+            conninfo=DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            timeout=30,
+            max_lifetime=300
         )
-        logger.info("Пул соединений PostgreSQL создан")
+
+        # Инициализируем пул
+        await db_pool.open()
+
+        logger.info("Async пул соединений PostgreSQL создан")
 
         # Создаем таблицы если их нет
-        create_tables()
+        await create_tables()
 
     except Exception as e:
         logger.error(f"Ошибка подключения к PostgreSQL: {e}")
         raise
 
 
-def get_connection():
-    """Получить соединение из пула"""
-    return connection_pool.getconn()
-
-
-def return_connection(conn):
-    """Вернуть соединение в пул"""
-    connection_pool.putconn(conn)
-
-
-def create_tables():
+async def create_tables():
     """Создать таблицы в PostgreSQL"""
-    conn = get_connection()
-    cursor = conn.cursor()
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cursor:
+            try:
+                # Таблица пользователей
+                await cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        telegram_id BIGINT UNIQUE NOT NULL,
+                        username VARCHAR(100),
+                        full_name VARCHAR(200) NOT NULL,
+                        role VARCHAR(20) CHECK(role IN ('tutor', 'student')),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        timezone VARCHAR(50) DEFAULT 'Europe/Moscow'
+                    )
+                ''')
 
-    try:
-        # Таблица пользователей
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE NOT NULL,
-                username VARCHAR(100),
-                full_name VARCHAR(200) NOT NULL,
-                role VARCHAR(20) CHECK(role IN ('tutor', 'student')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                timezone VARCHAR(50) DEFAULT 'Europe/Moscow'
-            )
-        ''')
+                # Таблица домашних заданий
+                await cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS homeworks (
+                        id SERIAL PRIMARY KEY,
+                        student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                        tutor_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                        task_text TEXT NOT NULL,
+                        deadline TIMESTAMP NOT NULL,
+                        is_completed BOOLEAN DEFAULT FALSE,
+                        completed_at TIMESTAMP,
+                        reminder_sent_24h BOOLEAN DEFAULT FALSE,
+                        reminder_sent_1h BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-        # Таблица домашних заданий
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS homeworks (
-                id SERIAL PRIMARY KEY,
-                student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                tutor_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                task_text TEXT NOT NULL,
-                deadline TIMESTAMP NOT NULL,
-                is_completed BOOLEAN DEFAULT FALSE,
-                completed_at TIMESTAMP,
-                reminder_sent_24h BOOLEAN DEFAULT FALSE,
-                reminder_sent_1h BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+                # Таблица расписания
+                await cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS schedule (
+                        id SERIAL PRIMARY KEY,
+                        student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                        tutor_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                        lesson_time TIMESTAMP NOT NULL,
+                        topic TEXT,
+                        duration_minutes INTEGER DEFAULT 60,
+                        notify_student BOOLEAN DEFAULT TRUE,
+                        reminder_sent BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
 
-        # Таблица расписания
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS schedule (
-                id SERIAL PRIMARY KEY,
-                student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                tutor_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                lesson_time TIMESTAMP NOT NULL,
-                topic TEXT,
-                duration_minutes INTEGER DEFAULT 60,
-                notify_student BOOLEAN DEFAULT TRUE,
-                reminder_sent BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+                # Индексы для производительности
+                await cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id)')
+                await cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)')
+                await cursor.execute('CREATE INDEX IF NOT EXISTS idx_homeworks_deadline ON homeworks(deadline)')
+                await cursor.execute('CREATE INDEX IF NOT EXISTS idx_homeworks_student_id ON homeworks(student_id)')
+                await cursor.execute('CREATE INDEX IF NOT EXISTS idx_schedule_lesson_time ON schedule(lesson_time)')
+                await cursor.execute('CREATE INDEX IF NOT EXISTS idx_schedule_student_id ON schedule(student_id)')
 
-        # Индексы для производительности
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_homeworks_deadline ON homeworks(deadline)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_homeworks_student_id ON homeworks(student_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_schedule_lesson_time ON schedule(lesson_time)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_schedule_student_id ON schedule(student_id)')
+                await conn.commit()
+                logger.info("Таблицы PostgreSQL созданы/проверены")
 
-        conn.commit()
-        logger.info("Таблицы PostgreSQL созданы/проверены")
-
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Ошибка создания таблиц: {e}")
-        raise
-    finally:
-        cursor.close()
-        return_connection(conn)
+            except Exception as e:
+                await conn.rollback()
+                logger.error(f"Ошибка создания таблиц: {e}")
+                raise
 
 
 async def db_execute(query: str, params: tuple = ()):
     """Выполнить SQL запрос (INSERT/UPDATE/DELETE)"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(query, params)
-        conn.commit()
-        return cursor.rowcount
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Ошибка выполнения запроса: {e}")
-        raise
-    finally:
-        cursor.close()
-        return_connection(conn)
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cursor:
+            try:
+                await cursor.execute(query, params)
+                await conn.commit()
+                return cursor.rowcount
+            except Exception as e:
+                await conn.rollback()
+                logger.error(f"Ошибка выполнения запроса: {e}")
+                raise
 
 
 async def db_fetchall(query: str, params: tuple = ()):
     """Выполнить запрос и вернуть все результаты"""
-    conn = get_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        cursor.execute(query, params)
-        return cursor.fetchall()
-    except Exception as e:
-        logger.error(f"Ошибка запроса fetchall: {e}")
-        return []
-    finally:
-        cursor.close()
-        return_connection(conn)
+    async with db_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cursor:
+            try:
+                await cursor.execute(query, params)
+                return await cursor.fetchall()
+            except Exception as e:
+                logger.error(f"Ошибка запроса fetchall: {e}")
+                return []
 
 
 async def db_fetchone(query: str, params: tuple = ()):
     """Выполнить запрос и вернуть одну строку"""
-    conn = get_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        cursor.execute(query, params)
-        return cursor.fetchone()
-    except Exception as e:
-        logger.error(f"Ошибка запроса fetchone: {e}")
-        return None
-    finally:
-        cursor.close()
-        return_connection(conn)
+    async with db_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cursor:
+            try:
+                await cursor.execute(query, params)
+                return await cursor.fetchone()
+            except Exception as e:
+                logger.error(f"Ошибка запроса fetchone: {e}")
+                return None
 
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
@@ -218,11 +199,6 @@ async def is_tutor(telegram_id: int) -> bool:
     if user:
         return user['role'] == 'tutor'
     return telegram_id == TUTOR_ID
-
-
-def format_datetime(dt: datetime) -> str:
-    """Форматирование даты-времени для отображения"""
-    return dt.strftime('%d.%m.%Y %H:%M')
 
 
 # ====================== КОМАНДЫ БОТА ======================
@@ -257,7 +233,8 @@ async def show_tutor_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать меню репетитора"""
     user_id = update.effective_user.id
     if not await is_tutor(user_id):
-        await update.message.reply_text("Доступно только репетитору!")
+        if update.message:
+            await update.message.reply_text("Доступно только репетитору!")
         return
 
     keyboard = [
@@ -276,7 +253,7 @@ async def show_tutor_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 Панель управления репетитора:",
             reply_markup=reply_markup
         )
-    else:
+    elif update.message:
         await update.message.reply_text(
             "📊 Панель управления репетитора:",
             reply_markup=reply_markup
@@ -680,10 +657,11 @@ async def add_lesson_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отмена текущего действия"""
-    await update.message.reply_text(
-        "Действие отменено.",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    if update.message:
+        await update.message.reply_text(
+            "Действие отменено.",
+            reply_markup=ReplyKeyboardRemove()
+        )
     await show_tutor_menu(update, context)
     return ConversationHandler.END
 
@@ -801,6 +779,33 @@ def get_student_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
+async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для неизвестных текстовых сообщений"""
+    if update.message:
+        user_id = update.effective_user.id
+
+        # Проверяем, не находится ли пользователь в процессе разговора
+        if 'selected_student' in context.user_data:
+            # Пользователь в процессе добавления ДЗ или занятия
+            await update.message.reply_text(
+                "Процесс отменен. Используйте /menu для начала заново.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            context.user_data.clear()
+        elif await is_tutor(user_id):
+            # Репетитор отправил случайное сообщение
+            await update.message.reply_text(
+                "Используйте /menu для доступа к панели управления.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Меню", callback_data='menu')]])
+            )
+        else:
+            # Ученик отправил случайное сообщение
+            await update.message.reply_text(
+                "Используйте кнопки ниже:",
+                reply_markup=get_student_keyboard()
+            )
+
+
 # ====================== ЗАПУСК БОТА ======================
 async def main():
     """Запуск бота"""
@@ -813,7 +818,7 @@ async def main():
         return
 
     # Инициализация БД
-    init_db()
+    await init_db()
 
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()
@@ -845,22 +850,25 @@ async def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
 
-    # Регистрируем обработчики
+    # Регистрируем обработчики В ПРАВИЛЬНОМ ПОРЯДКЕ!
+    # 1. Command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", show_tutor_menu))
+
+    # 2. Conversation handlers (должны быть до CallbackQueryHandler)
     application.add_handler(conv_handler)
     application.add_handler(conv_handler_lesson)
+
+    # 3. Callback query handler
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Простой обработчик для случайных сообщений"""
-        await update.message.reply_text(
-            "Пожалуйста, используйте команды из меню или кнопки."
-        )
+    # 4. Общий обработчик текстовых сообщений (ПОСЛЕДНИМ!)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_message))
 
     # Запускаем бота
-    logger.info("Бот запущен с PostgreSQL...")
+    logger.info("Бот запущен с PostgreSQL (psycopg3)...")
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    if __name__ == '__main__':
-        asyncio.run(main())
+
+if __name__ == '__main__':
+    asyncio.run(main())
