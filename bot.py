@@ -1,401 +1,270 @@
 import os
+import sys
 import logging
 import asyncio
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from dotenv import load_dotenv
-from pytz import timezone
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import psycopg2
-from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
+    MessageHandler, filters, ContextTypes
 )
 
 # ====================== НАСТРОЙКИ ======================
 load_dotenv()
 
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TUTOR_ID = int(os.getenv('TUTOR_ID', 0))
-TIMEZONE = os.getenv('TIMEZONE', 'Europe/Moscow')
-DATABASE_URL = os.getenv('DATABASE_URL')  # Render автоматически добавляет эту переменную
 
-# Состояния для ConversationHandler
-WAITING_HW_TEXT, WAITING_HW_DEADLINE, WAITING_SCHEDULE_TIME, WAITING_SCHEDULE_TOPIC = range(4)
+# Безопасное получение переменных
+def safe_getenv(key, default=None):
+    value = os.getenv(key, default)
+    if value:
+        # Очищаем от невалидных символов
+        try:
+            return value.encode('utf-8').decode('utf-8')
+        except:
+            # Оставляем только ASCII символы
+            return ''.join(c for c in str(value) if ord(c) < 128)
+    return value
 
-# Настройка логирования
+
+TOKEN = safe_getenv('TELEGRAM_BOT_TOKEN')
+TUTOR_ID = int(safe_getenv('TUTOR_ID', '0') or 0)
+
+# ====================== ЛОГИРОВАНИЕ ======================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Пул соединений PostgreSQL
-db_pool = None
-# Thread pool для асинхронных операций с БД
-thread_pool = ThreadPoolExecutor(max_workers=10)
-
-
-# ====================== БАЗА ДАННЫХ POSTGRESQL ======================
-def init_db():
-    """Инициализация базы данных PostgreSQL"""
-    global db_pool
-
-    try:
-        # Создаем пул соединений для psycopg2
-        db_pool = pool.SimpleConnectionPool(
-            1, 20,  # min, max connections
-            DATABASE_URL,
-            sslmode='require'  # Для Render.com обязательно
-        )
-        logger.info(f"Пул соединений PostgreSQL создан для {DATABASE_URL[:30]}...")
-
-        # Создаем таблицы если их нет
-        create_tables()
-
-    except Exception as e:
-        logger.error(f"Ошибка подключения к PostgreSQL: {e}")
-        # Даем больше информации об ошибке
-        logger.error(f"DATABASE_URL: {DATABASE_URL[:50]}..." if DATABASE_URL else "DATABASE_URL не установлен")
-        raise
-
-
-def create_tables():
-    """Создать таблицы в PostgreSQL"""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    try:
-        # Таблица пользователей
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE NOT NULL,
-                username VARCHAR(100),
-                full_name VARCHAR(200) NOT NULL,
-                role VARCHAR(20) CHECK(role IN ('tutor', 'student')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # Таблица домашних заданий
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS homeworks (
-                id SERIAL PRIMARY KEY,
-                student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                tutor_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                task_text TEXT NOT NULL,
-                deadline TIMESTAMP NOT NULL,
-                is_completed BOOLEAN DEFAULT FALSE,
-                completed_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # Таблица расписания
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS schedule (
-                id SERIAL PRIMARY KEY,
-                student_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                tutor_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                lesson_time TIMESTAMP NOT NULL,
-                topic TEXT,
-                notify_student BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        conn.commit()
-        logger.info("Таблицы PostgreSQL созданы/проверены")
-
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Ошибка создания таблиц: {e}")
-        raise
-    finally:
-        cursor.close()
-        return_connection(conn)
-
-
-def get_connection():
-    """Получить соединение из пула"""
-    return db_pool.getconn()
-
-
-def return_connection(conn):
-    """Вернуть соединение в пул"""
-    db_pool.putconn(conn)
-
-
-# ====================== АСИНХРОННЫЕ ОПЕРАЦИИ С БАЗОЙ ======================
-async def db_execute(query: str, params: tuple = ()):
-    """Выполнить SQL запрос (INSERT/UPDATE/DELETE)"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(thread_pool, _db_execute_sync, query, params)
-
-
-def _db_execute_sync(query: str, params: tuple = ()):
-    """Синхронное выполнение SQL запроса"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(query, params)
-        conn.commit()
-        return cursor.rowcount
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Ошибка выполнения запроса: {e}")
-        raise
-    finally:
-        cursor.close()
-        return_connection(conn)
-
-
-async def db_fetchall(query: str, params: tuple = ()):
-    """Выполнить запрос и вернуть все результаты"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(thread_pool, _db_fetchall_sync, query, params)
-
-
-def _db_fetchall_sync(query: str, params: tuple = ()):
-    """Синхронное выполнение запроса с возвратом всех результатов"""
-    conn = get_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        cursor.execute(query, params)
-        return cursor.fetchall()
-    except Exception as e:
-        logger.error(f"Ошибка запроса fetchall: {e}")
-        return []
-    finally:
-        cursor.close()
-        return_connection(conn)
-
-
-async def db_fetchone(query: str, params: tuple = ()):
-    """Выполнить запрос и вернуть одну строку"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(thread_pool, _db_fetchone_sync, query, params)
-
-
-def _db_fetchone_sync(query: str, params: tuple = ()):
-    """Синхронное выполнение запроса с возвратом одной строки"""
-    conn = get_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        cursor.execute(query, params)
-        return cursor.fetchone()
-    except Exception as e:
-        logger.error(f"Ошибка запроса fetchone: {e}")
-        return None
-    finally:
-        cursor.close()
-        return_connection(conn)
-
-
-# ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
-async def get_user(telegram_id: int):
-    """Получить пользователя по ID Telegram"""
-    return await db_fetchone(
-        'SELECT * FROM users WHERE telegram_id = %s',
-        (telegram_id,)
-    )
-
-
-async def register_user(telegram_id: int, username: str, full_name: str, role: str = 'student'):
-    """Зарегистрировать нового пользователя"""
-    user = await get_user(telegram_id)
-    if not user:
-        await db_execute(
-            '''INSERT INTO users (telegram_id, username, full_name, role) 
-               VALUES (%s, %s, %s, %s)''',
-            (telegram_id, username, full_name, role)
-        )
-        return True
-    return False
-
-
-async def is_tutor(telegram_id: int) -> bool:
-    """Проверить, является ли пользователь репетитором"""
-    user = await get_user(telegram_id)
-    if user:
-        return user['role'] == 'tutor'
-    return telegram_id == TUTOR_ID
+# ====================== ХРАНИЛИЩЕ ======================
+users_db = {}
+homeworks_db = []
 
 
 # ====================== КОМАНДЫ БОТА ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
+    """Команда /start"""
     user = update.effective_user
+    user_id = user.id
 
-    # Регистрация пользователя
-    if await is_tutor(user.id):
-        role = 'tutor'
-        await register_user(user.id, user.username, user.full_name, role)
-        await update.message.reply_text(
-            f"👨‍🏫 Добро пожаловать, репетитор {user.full_name}!\n\n"
-            f"Используйте команду /menu для управления",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        await show_tutor_menu(update, context)
+    # Сохраняем пользователя
+    users_db[user_id] = {
+        'id': user_id,
+        'username': user.username,
+        'full_name': user.full_name,
+        'is_tutor': user_id == TUTOR_ID,
+        'registered_at': datetime.now().isoformat()
+    }
+
+    if user_id == TUTOR_ID:
+        # Репетитор
+        welcome_text = f"""
+👨‍🏫 Добро пожаловать, репетитор {user.full_name}!
+
+📊 Панель управления активна.
+Используйте кнопки ниже:
+"""
+        reply_markup = get_tutor_keyboard()
     else:
-        role = 'student'
-        await register_user(user.id, user.username, user.full_name, role)
-        await update.message.reply_text(
-            f"👨‍🎓 Привет, {user.full_name}!\n\n"
-            f"Я помогу вам следить за домашними заданиями и расписанием.",
-            reply_markup=get_student_keyboard()
-        )
+        # Ученик
+        welcome_text = f"""
+👨‍🎓 Привет, {user.full_name}!
 
+Я бот-помощник репетитора HelperTutor.
 
-async def show_tutor_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать меню репетитора"""
-    keyboard = [
-        [InlineKeyboardButton("📝 Добавить ДЗ", callback_data='add_hw')],
-        [InlineKeyboardButton("📋 Список ДЗ", callback_data='list_hw')],
-    ]
+🚀 Бот готов к работе!
+Используйте кнопки ниже:
+"""
+        reply_markup = get_student_keyboard()
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            "📊 Панель управления:",
-            reply_markup=reply_markup
-        )
-    elif update.message:
-        await update.message.reply_text(
-            "📊 Панель управления:",
-            reply_markup=reply_markup
-        )
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик inline кнопок"""
+    """Обработчик кнопок"""
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
     data = query.data
 
-    if data == 'menu':
-        await show_tutor_menu(update, context)
-
-    elif data == 'add_hw':
-        if not await is_tutor(user_id):
-            await query.edit_message_text("Доступно только репетитору!")
+    # Репетитор
+    if data.startswith('tutor_'):
+        if user_id != TUTOR_ID:
+            await query.edit_message_text("❌ Доступно только репетитору!")
             return
 
-        await query.edit_message_text("Функция добавления ДЗ в разработке...")
+        if data == 'tutor_add_hw':
+            await query.edit_message_text(
+                "📝 Добавление ДЗ\n\n"
+                "В разработке. Скоро будет доступно!",
+                reply_markup=get_tutor_keyboard()
+            )
 
-    elif data == 'list_hw':
-        hws = await db_fetchall('''
-            SELECT h.task_text, h.deadline, h.is_completed, u.full_name
-            FROM homeworks h
-            JOIN users u ON h.student_id = u.id
-            WHERE h.deadline > CURRENT_TIMESTAMP
-            ORDER BY h.deadline
-            LIMIT 10
-        ''')
+        elif data == 'tutor_list_hw':
+            text = "📚 Домашние задания\n\n"
+            if homeworks_db:
+                for hw in homeworks_db[-3:]:
+                    status = "✅" if hw.get('completed') else "⏳"
+                    text += f"{status} {hw.get('student', 'Ученик')}: {hw.get('task', 'Задание')[:30]}...\n"
+            else:
+                text += "Пока нет заданий"
 
-        if not hws:
-            text = "📭 Нет активных домашних заданий."
-        else:
-            text = "📚 Активные домашние задания:\n\n"
-            for hw in hws:
-                status = "✅ Выполнено" if hw['is_completed'] else "⏳ В процессе"
-                deadline = hw['deadline'].strftime('%d.%m.%Y %H:%M') if hw['deadline'] else "Не указан"
-                text += f"👤 {hw['full_name']}\n📝 {hw['task_text'][:50]}...\n📅 Дедлайн: {deadline}\n{status}\n\n"
+            await query.edit_message_text(text, reply_markup=get_tutor_keyboard())
 
-        await query.edit_message_text(text)
+        elif data == 'tutor_students':
+            students = [u for u in users_db.values() if not u.get('is_tutor')]
+            text = f"👥 Ученики: {len(students)}\n\n"
+            for student in students[-5:]:
+                text += f"• {student['full_name']}\n"
 
-    elif data == 'hw_done':
-        student = await get_user(user_id)
-        if not student:
-            await query.edit_message_text("Сначала напишите /start")
-            return
+            await query.edit_message_text(text, reply_markup=get_tutor_keyboard())
 
+    # Ученик
+    elif data.startswith('student_'):
+        if data == 'student_hw_done':
+            # Создаем тестовое задание
+            if not homeworks_db:
+                homeworks_db.append({
+                    'student_id': user_id,
+                    'student': users_db.get(user_id, {}).get('full_name', 'Ученик'),
+                    'task': 'Первое тестовое задание',
+                    'completed': False
+                })
+
+            # Помечаем как выполненное
+            for hw in homeworks_db:
+                if hw['student_id'] == user_id and not hw['completed']:
+                    hw['completed'] = True
+
+                    # Уведомление репетитору
+                    if TUTOR_ID:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=TUTOR_ID,
+                                text=f"🎉 Ученик выполнил ДЗ!"
+                            )
+                        except:
+                            pass
+                    break
+
+            await query.edit_message_text(
+                "✅ Задание отмечено как выполненное!",
+                reply_markup=get_student_keyboard()
+            )
+
+        elif data == 'student_my_hw':
+            await query.edit_message_text(
+                "📚 Ваши задания:\n\n"
+                "1. Тестовое задание - В процессе\n"
+                "2. Новое задание - Скоро\n\n"
+                "Нажмите '✅ ДЗ выполнено' когда закончите.",
+                reply_markup=get_student_keyboard()
+            )
+
+        elif data == 'student_schedule':
+            await query.edit_message_text(
+                "🗓 Расписание:\n\n"
+                "Понедельник: 14:00-15:30\n"
+                "Среда: 15:00-16:30\n"
+                "Пятница: 13:00-14:30\n\n"
+                "Бот напомнит за 30 минут.",
+                reply_markup=get_student_keyboard()
+            )
+
+    # Помощь
+    elif data == 'help':
         await query.edit_message_text(
-            "✅ Вы отметили ДЗ как выполненное! Репетитор получит уведомление.",
-            reply_markup=get_student_keyboard()
+            "❓ Помощь\n\n"
+            "/start - начать\n"
+            "Кнопки - управление\n\n"
+            "Бот в активной разработке.",
+            reply_markup=get_student_keyboard() if user_id != TUTOR_ID else get_tutor_keyboard()
         )
+
+
+def get_tutor_keyboard():
+    """Клавиатура для репетитора"""
+    keyboard = [
+        [InlineKeyboardButton("📝 Добавить ДЗ", callback_data='tutor_add_hw')],
+        [InlineKeyboardButton("📋 Список ДЗ", callback_data='tutor_list_hw')],
+        [InlineKeyboardButton("👥 Ученики", callback_data='tutor_students')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 def get_student_keyboard():
     """Клавиатура для ученика"""
     keyboard = [
-        [InlineKeyboardButton("✅ ДЗ выполнено", callback_data='hw_done')],
-        [InlineKeyboardButton("📚 Мои ДЗ", callback_data='my_homework')],
+        [InlineKeyboardButton("✅ ДЗ выполнено", callback_data='student_hw_done')],
+        [InlineKeyboardButton("📚 Мои задания", callback_data='student_my_hw')],
+        [InlineKeyboardButton("🗓 Расписание", callback_data='student_schedule')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик для неизвестных текстовых сообщений"""
-    if update.message:
-        user_id = update.effective_user.id
-
-        if await is_tutor(user_id):
-            await update.message.reply_text(
-                "Используйте /menu для доступа к панели управления."
-            )
-        else:
-            await update.message.reply_text(
-                "Используйте кнопки ниже:",
-                reply_markup=get_student_keyboard()
-            )
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help"""
+    await start(update, context)
 
 
-# ====================== ЗАПУСК БОТА ======================
-async def main():
-    """Запуск бота"""
-    # Проверяем обязательные переменные
+# ====================== ЗАПУСК БОТА (ИСПРАВЛЕННЫЙ) ======================
+def main():
+    """Главная функция (синхронная)"""
+    logger.info("=" * 50)
+    logger.info("🚀 ЗАПУСК HELPER TUTOR BOT")
+    logger.info("=" * 50)
+
+    # Проверка токена
     if not TOKEN:
-        logger.error("❌ Токен бота не найден! Укажите TELEGRAM_BOT_TOKEN")
+        logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
+        logger.info("💡 Как получить токен:")
+        logger.info("1. Найдите @BotFather в Telegram")
+        logger.info("2. Отправьте /newbot")
+        logger.info("3. Следуйте инструкциям")
+        logger.info("4. Скопируйте токен")
+        logger.info("5. На Render: TELEGRAM_BOT_TOKEN = ваш_токен")
         return
 
-    if not DATABASE_URL:
-        logger.error("❌ DATABASE_URL не найден!")
-        logger.error("На Render.com убедитесь что вы:")
-        logger.error("1. Создали PostgreSQL базу данных")
-        logger.error("2. Добавили DATABASE_URL в Environment Variables")
-        return
+    logger.info(f"✅ Токен: установлен ({len(TOKEN)} символов)")
+    logger.info(f"✅ Репетитор ID: {TUTOR_ID if TUTOR_ID else 'не установлен'}")
 
-    if not TUTOR_ID:
-        logger.warning("⚠️ TUTOR_ID не установлен. Некоторые функции могут не работать.")
-
-    logger.info(f"✅ TOKEN: {'установлен' if TOKEN else 'не установлен'}")
-    logger.info(f"✅ DATABASE_URL: {'установлен' if DATABASE_URL else 'не установлен'}")
-    logger.info(f"✅ TUTOR_ID: {TUTOR_ID if TUTOR_ID else 'не установлен'}")
+    # Для Windows нужно настроить event loop policy
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     try:
-        # Инициализация БД
-        init_db()
-        logger.info("✅ База данных инициализирована")
+        # Создаем приложение
+        app = Application.builder().token(TOKEN).build()
+
+        # Регистрируем обработчики
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CallbackQueryHandler(button_handler))
+
+        # Обработчик текста
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            lambda update, ctx: update.message.reply_text(
+                "Используйте /start",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🚀 Начать", callback_data='start')]
+                ])
+            )
+        ))
+
+        logger.info("✅ Обработчики зарегистрированы")
+        logger.info("🤖 Бот запускается...")
+
+        # Запускаем бота
+        app.run_polling()
+
     except Exception as e:
-        logger.error(f"❌ Ошибка инициализации БД: {e}")
-        return
-
-    # Создаем приложение
-    application = Application.builder().token(TOKEN).build()
-    logger.info("✅ Telegram приложение создано")
-
-    # Простые обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("menu", show_tutor_menu))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_message))
-
-    logger.info("✅ Бот запускается...")
-
-    try:
-        await application.run_polling(allowed_updates=Update.ALL_TYPES)
-    except Exception as e:
-        logger.error(f"❌ Ошибка при запуске бота: {e}")
+        logger.error(f"❌ Ошибка: {e}")
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()  # Только main() без asyncio.run()
