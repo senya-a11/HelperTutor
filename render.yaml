@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: tutor-bot
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python bot.py
+    python:
+      version: "3.10.0"
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TUTOR_ID
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tutor-bot-db
+          property: connectionString
+      - key: TIMEZONE
+        value: Europe/Moscow
