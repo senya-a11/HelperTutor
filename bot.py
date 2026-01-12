@@ -2,12 +2,24 @@ import os
 import sys
 import logging
 import asyncio
+import signal
+import atexit
 import re
 from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 from pytz import timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# Импорт для веб-сервера
+try:
+    from aiohttp import web
+
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -17,6 +29,9 @@ from telegram.ext import (
 
 # ====================== НАСТРОЙКИ ======================
 load_dotenv()
+
+# Получаем порт из окружения (Render автоматически назначает PORT)
+PORT = int(os.getenv('PORT', 8080))
 
 # Состояния для ConversationHandler
 WAITING_HW_TEXT, WAITING_HW_DEADLINE, WAITING_HW_STUDENT, WAITING_LESSON_TIME, WAITING_LESSON_TOPIC, WAITING_LESSON_STUDENT = range(
@@ -45,14 +60,99 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ====================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ======================
+application = None
+scheduler = None
+web_runner = None
+
 # ====================== ХРАНИЛИЩЕ В ПАМЯТИ ======================
 users_db = {}  # telegram_id -> {id, username, full_name, role, created_at}
 homeworks_db = []  # [{id, student_id, tutor_id, task_text, deadline, is_completed, completed_at}]
 lessons_db = []  # [{id, student_id, tutor_id, lesson_time, topic, notify_student}]
 next_id = 1
 
-# Планировщик для напоминаний
-scheduler = AsyncIOScheduler(timezone=timezone(TIMEZONE))
+
+# ====================== ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECKS ======================
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    """Простой HTTP обработчик для health checks"""
+
+    def do_GET(self):
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            status = {
+                'status': 'ok',
+                'timestamp': datetime.now().isoformat(),
+                'service': 'helper-tutor-bot',
+                'stats': {
+                    'users': len(users_db),
+                    'homeworks': len(homeworks_db),
+                    'lessons': len(lessons_db),
+                    'active_homeworks': len([h for h in homeworks_db if not h.get('is_completed')])
+                }
+            }
+            import json
+            self.wfile.write(json.dumps(status).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        logger.debug(f"HTTP {self.address_string()} - {format % args}")
+
+
+def run_http_server():
+    """Запуск HTTP сервера в отдельном потоке"""
+    server = HTTPServer(('0.0.0.0', PORT), SimpleHTTPRequestHandler)
+    logger.info(f"🌐 HTTP сервер запущен на порту {PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+async def start_web_server():
+    """Запуск веб-сервера (aiohttp если доступен, иначе простой HTTP)"""
+    global web_runner
+
+    if HAS_AIOHTTP:
+        # Используем aiohttp если установлен
+        app = web.Application()
+
+        async def health_check(request):
+            status = {
+                'status': 'ok',
+                'timestamp': datetime.now().isoformat(),
+                'service': 'helper-tutor-bot',
+                'stats': {
+                    'users': len(users_db),
+                    'homeworks': len(homeworks_db),
+                    'lessons': len(lessons_db),
+                    'active_homeworks': len([h for h in homeworks_db if not h.get('is_completed')])
+                }
+            }
+            return web.json_response(status)
+
+        app.router.add_get('/health', health_check)
+        app.router.add_get('/', health_check)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
+
+        web_runner = runner
+        logger.info(f"🌐 aiohttp сервер запущен на порту {PORT}")
+        return runner
+    else:
+        # Запускаем простой HTTP сервер в отдельном потоке
+        thread = threading.Thread(target=run_http_server, daemon=True)
+        thread.start()
+        logger.info(f"🌐 Простой HTTP сервер запущен на порту {PORT}")
+        return thread
 
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
@@ -127,7 +227,8 @@ def get_upcoming_lessons():
 def schedule_reminders():
     """Запланировать напоминания для активных ДЗ и занятий"""
     # Сбрасываем старые задания
-    scheduler.remove_all_jobs()
+    if scheduler:
+        scheduler.remove_all_jobs()
 
     now = datetime.now()
 
@@ -163,8 +264,8 @@ def schedule_reminders():
                           f"⏰ СРОЧНО: ДЗ через 1 час!\n📝 {hw['task_text'][:50]}..."],
                     id=f"hw_1h_{hw['id']}"
                 )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Ошибка планирования напоминания ДЗ: {e}")
 
     # Напоминания о занятиях
     for lesson in get_upcoming_lessons():
@@ -187,15 +288,16 @@ def schedule_reminders():
                           f"👨‍🏫 Напоминание: занятие через 1 час{topic}\n🕐 Начало: {format_datetime(lesson['lesson_time'])}"],
                     id=f"lesson_{lesson['id']}"
                 )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Ошибка планирования напоминания занятия: {e}")
 
 
 async def send_reminder(chat_id: int, message: str):
     """Отправить напоминание"""
     try:
-        await application.bot.send_message(chat_id=chat_id, text=message)
-        logger.info(f"Напоминание отправлено {chat_id}")
+        if application:
+            await application.bot.send_message(chat_id=chat_id, text=message)
+            logger.info(f"Напоминание отправлено {chat_id}")
     except Exception as e:
         logger.error(f"Ошибка отправки напоминания: {e}")
 
@@ -820,10 +922,83 @@ def get_student_main_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-# ====================== ЗАПУСК БОТА ======================
-def main():
-    """Главная функция"""
-    global application
+# ====================== ОБРАБОТЧИКИ ОШИБОК ======================
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+
+    # Обработка конфликта (когда запущено несколько ботов)
+    if "Conflict" in str(context.error) and "getUpdates" in str(context.error):
+        logger.error("⚠️ Обнаружен конфликт! Возможно запущено несколько экземпляров бота.")
+
+    # Отправляем сообщение пользователю при ошибке
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Произошла ошибка. Пожалуйста, попробуйте позже или обратитесь к администратору."
+            )
+    except:
+        pass
+
+
+# ====================== GRACEFUL SHUTDOWN ======================
+def shutdown_handler(signum=None, frame=None):
+    """Обработчик завершения работы"""
+    logger.info("🚫 Получен сигнал завершения...")
+
+    global scheduler, application, web_runner
+
+    # Останавливаем планировщик
+    if scheduler and scheduler.running:
+        scheduler.shutdown()
+        logger.info("✅ Планировщик остановлен")
+
+    # Останавливаем бота
+    if application:
+        try:
+            # Останавливаем polling
+            if application.updater and application.updater.running:
+                application.updater.stop()
+
+            # Останавливаем application
+            application.stop()
+            application.shutdown()
+            logger.info("✅ Бот остановлен")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при остановке бота: {e}")
+
+    # Останавливаем веб-сервер
+    if HAS_AIOHTTP and web_runner:
+        try:
+            import asyncio as async_lib
+            loop = async_lib.new_event_loop()
+            async_lib.set_event_loop(loop)
+            loop.run_until_complete(web_runner.cleanup())
+            logger.info("✅ Веб-сервер остановлен")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при остановке веб-сервера: {e}")
+
+    logger.info("👋 Бот завершил работу")
+    sys.exit(0)
+
+
+def register_shutdown_handlers():
+    """Регистрация обработчиков завершения"""
+    # Для Ctrl+C
+    signal.signal(signal.SIGINT, shutdown_handler)
+
+    # Для системных сигналов
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, shutdown_handler)
+
+    # При выходе
+    atexit.register(shutdown_handler)
+
+
+# ====================== ОСНОВНАЯ ФУНКЦИЯ ======================
+async def main_async():
+    """Асинхронная основная функция"""
+    global application, scheduler
 
     logger.info("=" * 60)
     logger.info("🚀 ЗАПУСК HELPER TUTOR BOT")
@@ -837,14 +1012,25 @@ def main():
 
     logger.info(f"✅ Токен: установлен")
     logger.info(f"✅ Репетитор ID: {TUTOR_ID if TUTOR_ID else 'не установлен'}")
+    logger.info(f"✅ Порт веб-сервера: {PORT}")
 
-    # Для Windows
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Запускаем веб-сервер для health checks
+    await start_web_server()
 
     try:
+        # Для Windows
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
         # Создаем приложение
         application = Application.builder().token(TOKEN).build()
+
+        # Добавляем обработчик ошибок
+        application.add_error_handler(error_handler)
+
+        # Создаем планировщик
+        scheduler = AsyncIOScheduler(timezone=timezone(TIMEZONE))
+        scheduler.start()
 
         # Conversation Handler для добавления ДЗ
         conv_hw_handler = ConversationHandler(
@@ -895,21 +1081,60 @@ def main():
         # Обработчик неизвестных сообщений
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
 
-        # Запускаем планировщик напоминаний
-        scheduler.start()
-        schedule_reminders()
-
         logger.info("✅ Обработчики зарегистрированы")
+
+        # Запускаем планировщик напоминаний
+        schedule_reminders()
         logger.info("✅ Планировщик запущен")
+
         logger.info("🤖 Бот запускается...")
 
         # Запускаем бота
-        application.run_polling()
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
 
+        logger.info("✅ Бот успешно запущен!")
+        logger.info("👉 Напишите боту /start в Telegram")
+        logger.info(f"🌐 Health check доступен по адресу: http://0.0.0.0:{PORT}/health")
+
+        # Бесконечный цикл чтобы приложение не завершалось
+        while True:
+            await asyncio.sleep(3600)  # Спим 1 час
+
+    except asyncio.CancelledError:
+        logger.info("🛑 Получен сигнал отмены")
     except Exception as e:
-        logger.error(f"❌ Ошибка запуска: {e}", exc_info=True)
-        if 'scheduler' in locals():
+        logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
+    finally:
+        # Останавливаем бота
+        if application:
+            try:
+                await application.updater.stop()
+                await application.stop()
+                await application.shutdown()
+                logger.info("✅ Бот остановлен")
+            except Exception as e:
+                logger.error(f"❌ Ошибка при остановке бота: {e}")
+
+        # Останавливаем планировщик
+        if scheduler and scheduler.running:
             scheduler.shutdown()
+            logger.info("✅ Планировщик остановлен")
+
+
+def main():
+    """Точка входа"""
+    # Регистрируем обработчики завершения
+    register_shutdown_handlers()
+
+    # Запускаем асинхронную main
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("👋 Бот завершен пользователем")
+    except Exception as e:
+        logger.error(f"❌ Фатальная ошибка: {e}")
 
 
 if __name__ == '__main__':
