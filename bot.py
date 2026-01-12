@@ -2,34 +2,41 @@ import os
 import sys
 import logging
 import asyncio
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
+from typing import Optional
 from dotenv import load_dotenv
+from pytz import timezone
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
+    MessageHandler, filters, ContextTypes, ConversationHandler
 )
 
 # ====================== НАСТРОЙКИ ======================
 load_dotenv()
+
+# Состояния для ConversationHandler
+WAITING_HW_TEXT, WAITING_HW_DEADLINE, WAITING_HW_STUDENT, WAITING_LESSON_TIME, WAITING_LESSON_TOPIC, WAITING_LESSON_STUDENT = range(
+    6)
 
 
 # Безопасное получение переменных
 def safe_getenv(key, default=None):
     value = os.getenv(key, default)
     if value:
-        # Очищаем от невалидных символов
         try:
             return value.encode('utf-8').decode('utf-8')
         except:
-            # Оставляем только ASCII символы
             return ''.join(c for c in str(value) if ord(c) < 128)
     return value
 
 
 TOKEN = safe_getenv('TELEGRAM_BOT_TOKEN')
 TUTOR_ID = int(safe_getenv('TUTOR_ID', '0') or 0)
+TIMEZONE = safe_getenv('TIMEZONE', 'Europe/Moscow')
 
 # ====================== ЛОГИРОВАНИЕ ======================
 logging.basicConfig(
@@ -38,9 +45,159 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ====================== ХРАНИЛИЩЕ ======================
-users_db = {}
-homeworks_db = []
+# ====================== ХРАНИЛИЩЕ В ПАМЯТИ ======================
+users_db = {}  # telegram_id -> {id, username, full_name, role, created_at}
+homeworks_db = []  # [{id, student_id, tutor_id, task_text, deadline, is_completed, completed_at}]
+lessons_db = []  # [{id, student_id, tutor_id, lesson_time, topic, notify_student}]
+next_id = 1
+
+# Планировщик для напоминаний
+scheduler = AsyncIOScheduler(timezone=timezone(TIMEZONE))
+
+
+# ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
+def get_next_id():
+    global next_id
+    next_id += 1
+    return next_id - 1
+
+
+def get_user(telegram_id: int):
+    return users_db.get(telegram_id)
+
+
+def register_user(telegram_id: int, username: str, full_name: str, role: str = 'student'):
+    if telegram_id not in users_db:
+        users_db[telegram_id] = {
+            'id': telegram_id,
+            'telegram_id': telegram_id,
+            'username': username,
+            'full_name': full_name,
+            'role': role,
+            'created_at': datetime.now().isoformat()
+        }
+        return True
+    return False
+
+
+def is_tutor(telegram_id: int) -> bool:
+    user = get_user(telegram_id)
+    if user:
+        return user['role'] == 'tutor'
+    return telegram_id == TUTOR_ID
+
+
+def format_datetime(dt_str):
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        return dt.strftime('%d.%m.%Y %H:%M')
+    except:
+        return dt_str
+
+
+def parse_datetime(dt_str):
+    try:
+        return datetime.strptime(dt_str, '%d.%m.%Y %H:%M')
+    except ValueError:
+        try:
+            return datetime.strptime(dt_str, '%d.%m.%Y')
+        except:
+            return None
+
+
+def get_students():
+    return [u for u in users_db.values() if u.get('role') == 'student']
+
+
+def get_homeworks_for_student(student_id):
+    return [h for h in homeworks_db if h['student_id'] == student_id and not h.get('is_completed')]
+
+
+def get_active_homeworks():
+    now = datetime.now().isoformat()
+    return [h for h in homeworks_db if h['deadline'] > now and not h.get('is_completed')]
+
+
+def get_upcoming_lessons():
+    now = datetime.now().isoformat()
+    return [l for l in lessons_db if l['lesson_time'] > now]
+
+
+# ====================== НАПОМИНАНИЯ ======================
+def schedule_reminders():
+    """Запланировать напоминания для активных ДЗ и занятий"""
+    # Сбрасываем старые задания
+    scheduler.remove_all_jobs()
+
+    now = datetime.now()
+
+    # Напоминания о ДЗ
+    for hw in get_active_homeworks():
+        try:
+            deadline = datetime.fromisoformat(hw['deadline'])
+            student = get_user(hw['student_id'])
+
+            if not student:
+                continue
+
+            # За 24 часа
+            reminder_24h = deadline - timedelta(hours=24)
+            if reminder_24h > now:
+                scheduler.add_job(
+                    send_reminder,
+                    'date',
+                    run_date=reminder_24h,
+                    args=[student['telegram_id'],
+                          f"⏰ Напоминание: ДЗ через 24 часа!\n📝 {hw['task_text'][:50]}...\n📅 Дедлайн: {format_datetime(hw['deadline'])}"],
+                    id=f"hw_24h_{hw['id']}"
+                )
+
+            # За 1 час
+            reminder_1h = deadline - timedelta(hours=1)
+            if reminder_1h > now:
+                scheduler.add_job(
+                    send_reminder,
+                    'date',
+                    run_date=reminder_1h,
+                    args=[student['telegram_id'],
+                          f"⏰ СРОЧНО: ДЗ через 1 час!\n📝 {hw['task_text'][:50]}..."],
+                    id=f"hw_1h_{hw['id']}"
+                )
+        except:
+            pass
+
+    # Напоминания о занятиях
+    for lesson in get_upcoming_lessons():
+        try:
+            lesson_time = datetime.fromisoformat(lesson['lesson_time'])
+            student = get_user(lesson['student_id'])
+
+            if not student or not lesson.get('notify_student', True):
+                continue
+
+            # За 1 час
+            reminder_1h = lesson_time - timedelta(hours=1)
+            if reminder_1h > now:
+                topic = f" по теме: {lesson['topic']}" if lesson.get('topic') else ""
+                scheduler.add_job(
+                    send_reminder,
+                    'date',
+                    run_date=reminder_1h,
+                    args=[student['telegram_id'],
+                          f"👨‍🏫 Напоминание: занятие через 1 час{topic}\n🕐 Начало: {format_datetime(lesson['lesson_time'])}"],
+                    id=f"lesson_{lesson['id']}"
+                )
+        except:
+            pass
+
+
+async def send_reminder(chat_id: int, message: str):
+    """Отправить напоминание"""
+    try:
+        await application.bot.send_message(chat_id=chat_id, text=message)
+        logger.info(f"Напоминание отправлено {chat_id}")
+    except Exception as e:
+        logger.error(f"Ошибка отправки напоминания: {e}")
 
 
 # ====================== КОМАНДЫ БОТА ======================
@@ -49,222 +206,711 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
-    # Сохраняем пользователя
-    users_db[user_id] = {
-        'id': user_id,
-        'username': user.username,
-        'full_name': user.full_name,
-        'is_tutor': user_id == TUTOR_ID,
-        'registered_at': datetime.now().isoformat()
-    }
-
-    if user_id == TUTOR_ID:
-        # Репетитор
+    if is_tutor(user_id):
+        role = 'tutor'
         welcome_text = f"""
 👨‍🏫 Добро пожаловать, репетитор {user.full_name}!
 
-📊 Панель управления активна.
-Используйте кнопки ниже:
+Ваш ID: {user.id}
+Используйте /menu для управления
 """
-        reply_markup = get_tutor_keyboard()
+        reply_markup = get_tutor_main_keyboard()
     else:
-        # Ученик
+        role = 'student'
         welcome_text = f"""
 👨‍🎓 Привет, {user.full_name}!
 
 Я бот-помощник репетитора HelperTutor.
 
-🚀 Бот готов к работе!
-Используйте кнопки ниже:
+Я помогу вам:
+• Следить за домашними заданиями
+• Отмечать выполненные работы
+• Не пропускать занятия
+• Получать напоминания
 """
-        reply_markup = get_student_keyboard()
+        reply_markup = get_student_main_keyboard()
 
+    register_user(user_id, user.username, user.full_name, role)
     await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок"""
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню репетитора"""
+    if not is_tutor(update.effective_user.id):
+        await update.message.reply_text("Доступно только репетитору!")
+        return
+
+    await update.message.reply_text(
+        "📊 Панель управления репетитора:",
+        reply_markup=get_tutor_main_keyboard()
+    )
+
+
+async def tutor_add_hw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать добавление ДЗ"""
+    if update.callback_query:
+        await update.callback_query.answer()
+        query = update.callback_query
+        user_id = query.from_user.id
+    else:
+        user_id = update.effective_user.id
+
+    if not is_tutor(user_id):
+        if update.callback_query:
+            await query.edit_message_text("Доступно только репетитору!")
+        return
+
+    students = get_students()
+    if not students:
+        await update.callback_query.edit_message_text(
+            "Нет зарегистрированных учеников.",
+            reply_markup=get_tutor_main_keyboard()
+        )
+        return ConversationHandler.END
+
+    keyboard = []
+    for student in students:
+        keyboard.append([InlineKeyboardButton(
+            f"👤 {student['full_name']}",
+            callback_data=f"select_student_hw:{student['telegram_id']}"
+        )])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+
+    if update.callback_query:
+        await query.edit_message_text(
+            "👥 Выберите ученика для ДЗ:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    return WAITING_HW_STUDENT
+
+
+async def tutor_select_student_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбрать ученика для ДЗ"""
     query = update.callback_query
     await query.answer()
 
-    user_id = query.from_user.id
-    data = query.data
+    student_id = int(query.data.split(':')[1])
+    context.user_data['selected_student'] = student_id
 
-    # Репетитор
-    if data.startswith('tutor_'):
-        if user_id != TUTOR_ID:
-            await query.edit_message_text("❌ Доступно только репетитору!")
-            return
+    await query.edit_message_text(
+        "✏️ Введите текст домашнего задания:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+    )
 
-        if data == 'tutor_add_hw':
-            await query.edit_message_text(
-                "📝 Добавление ДЗ\n\n"
-                "В разработке. Скоро будет доступно!",
-                reply_markup=get_tutor_keyboard()
+    return WAITING_HW_TEXT
+
+
+async def tutor_hw_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить текст ДЗ"""
+    text = update.message.text
+    context.user_data['hw_text'] = text
+
+    await update.message.reply_text(
+        "📅 Введите дедлайн (формат: ДД.ММ.ГГГГ ЧЧ:ММ):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+    return WAITING_HW_DEADLINE
+
+
+async def tutor_hw_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить дедлайн ДЗ и сохранить"""
+    deadline_str = update.message.text
+    deadline = parse_datetime(deadline_str)
+
+    if not deadline:
+        await update.message.reply_text(
+            "❌ Неверный формат! Используйте ДД.ММ.ГГГГ ЧЧ:ММ\nПопробуйте еще раз:"
+        )
+        return WAITING_HW_DEADLINE
+
+    student_id = context.user_data.get('selected_student')
+    hw_text = context.user_data.get('hw_text')
+    tutor_id = update.effective_user.id
+
+    if not all([student_id, hw_text, tutor_id]):
+        await update.message.reply_text("❌ Ошибка данных. Начните заново.")
+        return ConversationHandler.END
+
+    # Сохраняем ДЗ
+    hw_id = get_next_id()
+    homeworks_db.append({
+        'id': hw_id,
+        'student_id': student_id,
+        'tutor_id': tutor_id,
+        'task_text': hw_text,
+        'deadline': deadline.isoformat(),
+        'is_completed': False,
+        'completed_at': None,
+        'created_at': datetime.now().isoformat()
+    })
+
+    # Обновляем напоминания
+    schedule_reminders()
+
+    # Отправляем уведомление ученику
+    student = get_user(student_id)
+    if student:
+        try:
+            await update._bot.send_message(
+                chat_id=student_id,
+                text=f"📚 Новое домашнее задание!\n\n📝 {hw_text}\n📅 Дедлайн: {deadline_str}\n\nНажмите '✅ ДЗ выполнено' когда выполните."
             )
+        except:
+            pass
 
-        elif data == 'tutor_list_hw':
-            text = "📚 Домашние задания\n\n"
-            if homeworks_db:
-                for hw in homeworks_db[-3:]:
-                    status = "✅" if hw.get('completed') else "⏳"
-                    text += f"{status} {hw.get('student', 'Ученик')}: {hw.get('task', 'Задание')[:30]}...\n"
-            else:
-                text += "Пока нет заданий"
+    await update.message.reply_text(
+        f"✅ ДЗ успешно добавлено для {student['full_name'] if student else 'ученика'}!\n"
+        f"Дедлайн: {deadline_str}",
+        reply_markup=get_tutor_main_keyboard()
+    )
 
-            await query.edit_message_text(text, reply_markup=get_tutor_keyboard())
+    # Очищаем временные данные
+    context.user_data.clear()
 
-        elif data == 'tutor_students':
-            students = [u for u in users_db.values() if not u.get('is_tutor')]
-            text = f"👥 Ученики: {len(students)}\n\n"
-            for student in students[-5:]:
-                text += f"• {student['full_name']}\n"
+    return ConversationHandler.END
 
-            await query.edit_message_text(text, reply_markup=get_tutor_keyboard())
 
-    # Ученик
-    elif data.startswith('student_'):
-        if data == 'student_hw_done':
-            # Создаем тестовое задание
-            if not homeworks_db:
-                homeworks_db.append({
-                    'student_id': user_id,
-                    'student': users_db.get(user_id, {}).get('full_name', 'Ученик'),
-                    'task': 'Первое тестовое задание',
-                    'completed': False
-                })
+async def tutor_list_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список ДЗ"""
+    if update.callback_query:
+        await update.callback_query.answer()
+        query = update.callback_query
+    else:
+        query = None
 
-            # Помечаем как выполненное
-            for hw in homeworks_db:
-                if hw['student_id'] == user_id and not hw['completed']:
-                    hw['completed'] = True
+    active_hws = get_active_homeworks()
 
-                    # Уведомление репетитору
-                    if TUTOR_ID:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=TUTOR_ID,
-                                text=f"🎉 Ученик выполнил ДЗ!"
-                            )
-                        except:
-                            pass
-                    break
+    if not active_hws:
+        text = "📭 Нет активных домашних заданий."
+    else:
+        text = "📚 Активные домашние задания:\n\n"
+        for hw in active_hws[:10]:  # Показываем первые 10
+            student = get_user(hw['student_id'])
+            tutor = get_user(hw['tutor_id'])
+            status = "✅ Выполнено" if hw.get('is_completed') else "⏳ В процессе"
+            text += f"👤 Ученик: {student['full_name'] if student else 'Неизвестен'}\n"
+            text += f"👨‍🏫 Репетитор: {tutor['full_name'] if tutor else 'Неизвестен'}\n"
+            text += f"📝 {hw['task_text'][:50]}...\n"
+            text += f"📅 Дедлайн: {format_datetime(hw['deadline'])}\n"
+            text += f"{status}\n\n"
 
-            await query.edit_message_text(
-                "✅ Задание отмечено как выполненное!",
-                reply_markup=get_student_keyboard()
-            )
+    if query:
+        await query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=get_tutor_main_keyboard())
 
-        elif data == 'student_my_hw':
-            await query.edit_message_text(
-                "📚 Ваши задания:\n\n"
-                "1. Тестовое задание - В процессе\n"
-                "2. Новое задание - Скоро\n\n"
-                "Нажмите '✅ ДЗ выполнено' когда закончите.",
-                reply_markup=get_student_keyboard()
-            )
 
-        elif data == 'student_schedule':
-            await query.edit_message_text(
-                "🗓 Расписание:\n\n"
-                "Понедельник: 14:00-15:30\n"
-                "Среда: 15:00-16:30\n"
-                "Пятница: 13:00-14:30\n\n"
-                "Бот напомнит за 30 минут.",
-                reply_markup=get_student_keyboard()
-            )
+async def tutor_list_students(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список учеников"""
+    if update.callback_query:
+        await update.callback_query.answer()
+        query = update.callback_query
+    else:
+        query = None
 
-    # Помощь
-    elif data == 'help':
+    students = get_students()
+
+    if not students:
+        text = "👥 Нет зарегистрированных учеников."
+    else:
+        text = f"👥 Список учеников ({len(students)}):\n\n"
+        for student in students:
+            username = f"(@{student['username']})" if student['username'] else ""
+            hws = get_homeworks_for_student(student['telegram_id'])
+            completed = len(
+                [h for h in homeworks_db if h['student_id'] == student['telegram_id'] and h.get('is_completed')])
+            text += f"• {student['full_name']} {username}\n"
+            text += f"  📊 Активных ДЗ: {len(hws)}, Выполнено: {completed}\n\n"
+
+    if query:
+        await query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=get_tutor_main_keyboard())
+
+
+async def tutor_add_lesson_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать добавление занятия"""
+    if update.callback_query:
+        await update.callback_query.answer()
+        query = update.callback_query
+        user_id = query.from_user.id
+    else:
+        user_id = update.effective_user.id
+
+    if not is_tutor(user_id):
+        if update.callback_query:
+            await query.edit_message_text("Доступно только репетитору!")
+        return
+
+    students = get_students()
+    if not students:
+        await update.callback_query.edit_message_text(
+            "Нет зарегистрированных учеников.",
+            reply_markup=get_tutor_main_keyboard()
+        )
+        return ConversationHandler.END
+
+    keyboard = []
+    for student in students:
+        keyboard.append([InlineKeyboardButton(
+            f"👤 {student['full_name']}",
+            callback_data=f"select_student_lesson:{student['telegram_id']}"
+        )])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+
+    if update.callback_query:
         await query.edit_message_text(
-            "❓ Помощь\n\n"
-            "/start - начать\n"
-            "Кнопки - управление\n\n"
-            "Бот в активной разработке.",
-            reply_markup=get_student_keyboard() if user_id != TUTOR_ID else get_tutor_keyboard()
+            "👥 Выберите ученика для занятия:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    return WAITING_LESSON_STUDENT
+
+
+async def tutor_select_student_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбрать ученика для занятия"""
+    query = update.callback_query
+    await query.answer()
+
+    student_id = int(query.data.split(':')[1])
+    context.user_data['selected_student'] = student_id
+
+    await query.edit_message_text(
+        "🕐 Введите дату и время занятия (формат: ДД.ММ.ГГГГ ЧЧ:ММ):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+    )
+
+    return WAITING_LESSON_TIME
+
+
+async def tutor_lesson_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить время занятия"""
+    time_str = update.message.text
+    lesson_time = parse_datetime(time_str)
+
+    if not lesson_time:
+        await update.message.reply_text(
+            "❌ Неверный формат! Используйте ДД.ММ.ГГГГ ЧЧ:ММ\nПопробуйте еще раз:"
+        )
+        return WAITING_LESSON_TIME
+
+    context.user_data['lesson_time'] = lesson_time.isoformat()
+
+    await update.message.reply_text(
+        "📌 Введите тему занятия (или отправьте '-' чтобы пропустить):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+    return WAITING_LESSON_TOPIC
+
+
+async def tutor_lesson_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить тему занятия и сохранить"""
+    topic = update.message.text if update.message.text != '-' else None
+    student_id = context.user_data.get('selected_student')
+    lesson_time = context.user_data.get('lesson_time')
+    tutor_id = update.effective_user.id
+
+    if not all([student_id, lesson_time, tutor_id]):
+        await update.message.reply_text("❌ Ошибка данных. Начните заново.")
+        return ConversationHandler.END
+
+    # Сохраняем занятие
+    lesson_id = get_next_id()
+    lessons_db.append({
+        'id': lesson_id,
+        'student_id': student_id,
+        'tutor_id': tutor_id,
+        'lesson_time': lesson_time,
+        'topic': topic,
+        'notify_student': True,
+        'created_at': datetime.now().isoformat()
+    })
+
+    # Обновляем напоминания
+    schedule_reminders()
+
+    # Отправляем уведомление ученику
+    student = get_user(student_id)
+    if student:
+        try:
+            await update._bot.send_message(
+                chat_id=student_id,
+                text=f"📅 Новое занятие!\n\n🕐 {format_datetime(lesson_time)}\n"
+                     f"📌 Тема: {topic if topic else 'Не указана'}"
+            )
+        except:
+            pass
+
+    await update.message.reply_text(
+        f"✅ Занятие успешно добавлено для {student['full_name'] if student else 'ученика'}!\n"
+        f"Время: {format_datetime(lesson_time)}\n"
+        f"Тема: {topic if topic else 'Не указана'}",
+        reply_markup=get_tutor_main_keyboard()
+    )
+
+    # Очищаем временные данные
+    context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+async def tutor_list_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список занятий"""
+    if update.callback_query:
+        await update.callback_query.answer()
+        query = update.callback_query
+    else:
+        query = None
+
+    upcoming_lessons = get_upcoming_lessons()
+
+    if not upcoming_lessons:
+        text = "🗓 Нет запланированных занятий."
+    else:
+        text = "🗓 Ближайшие занятия:\n\n"
+        for lesson in upcoming_lessons[:10]:  # Показываем первые 10
+            student = get_user(lesson['student_id'])
+            tutor = get_user(lesson['tutor_id'])
+            notify = "🔔" if lesson.get('notify_student', True) else "🔕"
+            text += f"👤 Ученик: {student['full_name'] if student else 'Неизвестен'}\n"
+            text += f"👨‍🏫 Репетитор: {tutor['full_name'] if tutor else 'Неизвестен'}\n"
+            text += f"🕐 {format_datetime(lesson['lesson_time'])}\n"
+            text += f"📌 Тема: {lesson.get('topic', 'Не указана')}\n"
+            text += f"{notify} Уведомления\n\n"
+
+    if query:
+        await query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=get_tutor_main_keyboard())
+
+
+async def tutor_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление напоминаниями"""
+    schedule_reminders()
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "🔄 Напоминания обновлены!",
+            reply_markup=get_tutor_main_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            "🔄 Напоминания обновлены!",
+            reply_markup=get_tutor_main_keyboard()
         )
 
 
-def get_tutor_keyboard():
-    """Клавиатура для репетитора"""
+async def student_hw_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ученик отмечает ДЗ выполненным"""
+    user_id = update.effective_user.id
+
+    # Находим активные ДЗ для ученика
+    student_hws = get_homeworks_for_student(user_id)
+
+    if not student_hws:
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                "📭 У вас нет активных домашних заданий.",
+                reply_markup=get_student_main_keyboard()
+            )
+        return
+
+    # Берем первое невыполненное ДЗ
+    hw = student_hws[0]
+    hw['is_completed'] = True
+    hw['completed_at'] = datetime.now().isoformat()
+
+    # Отправляем уведомление репетитору
+    tutor = get_user(hw['tutor_id'])
+    student = get_user(user_id)
+
+    if tutor and TUTOR_ID:
+        try:
+            await update._bot.send_message(
+                chat_id=TUTOR_ID,
+                text=f"🎉 Ученик {student['full_name'] if student else 'Неизвестен'} выполнил ДЗ!\n\n"
+                     f"📝 {hw['task_text'][:100]}...\n"
+                     f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+            )
+        except:
+            pass
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            f"✅ Отлично! Вы выполнили задание:\n\n"
+            f"📝 {hw['task_text'][:200]}...\n\n"
+            f"Репетитор получил уведомление.",
+            reply_markup=get_student_main_keyboard()
+        )
+
+
+async def student_my_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Мои ДЗ"""
+    user_id = update.effective_user.id
+
+    all_hws = [h for h in homeworks_db if h['student_id'] == user_id]
+    active_hws = [h for h in all_hws if not h.get('is_completed')]
+    completed_hws = [h for h in all_hws if h.get('is_completed')]
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        query = update.callback_query
+    else:
+        query = None
+
+    if not active_hws and not completed_hws:
+        text = "📭 У вас нет домашних заданий."
+    else:
+        text = "📚 Ваши домашние задания:\n\n"
+
+        if active_hws:
+            text += "⏳ Активные:\n"
+            for hw in active_hws[:5]:  # Показываем первые 5
+                text += f"• {hw['task_text'][:50]}...\n"
+                text += f"  📅 Дедлайн: {format_datetime(hw['deadline'])}\n\n"
+
+        if completed_hws:
+            text += "✅ Выполненные:\n"
+            for hw in completed_hws[-3:]:  # Показываем последние 3
+                completed_at = format_datetime(hw.get('completed_at', ''))
+                text += f"• {hw['task_text'][:50]}...\n"
+                text += f"  🏁 Выполнено: {completed_at}\n\n"
+
+    if query:
+        await query.edit_message_text(text, reply_markup=get_student_main_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=get_student_main_keyboard())
+
+
+async def student_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Мое расписание"""
+    user_id = update.effective_user.id
+
+    student_lessons = [l for l in lessons_db if l['student_id'] == user_id]
+    upcoming_lessons = [l for l in student_lessons if l['lesson_time'] > datetime.now().isoformat()]
+    past_lessons = [l for l in student_lessons if l['lesson_time'] <= datetime.now().isoformat()]
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        query = update.callback_query
+    else:
+        query = None
+
+    if not upcoming_lessons and not past_lessons:
+        text = "🗓 У вас нет запланированных занятий."
+    else:
+        text = "🗓 Ваше расписание:\n\n"
+
+        if upcoming_lessons:
+            text += "📅 Предстоящие:\n"
+            for lesson in upcoming_lessons[:5]:  # Показываем первые 5
+                text += f"• {format_datetime(lesson['lesson_time'])}\n"
+                text += f"  📌 {lesson.get('topic', 'Без темы')}\n"
+                text += f"  🔔 {'Уведомление включено' if lesson.get('notify_student', True) else 'Уведомление выключено'}\n\n"
+
+        if past_lessons:
+            text += "📜 Прошедшие:\n"
+            for lesson in past_lessons[-3:]:  # Показываем последние 3
+                text += f"• {format_datetime(lesson['lesson_time'])}\n"
+                text += f"  📌 {lesson.get('topic', 'Без темы')}\n\n"
+
+    if query:
+        await query.edit_message_text(text, reply_markup=get_student_main_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=get_student_main_keyboard())
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Справка"""
+    help_text = """
+📚 HelperTutor - Бот-помощник репетитора
+
+👨‍🏫 Для репетитора:
+/menu - Панель управления
+• Добавление ДЗ и занятий
+• Просмотр учеников
+• Управление напоминаниями
+
+👨‍🎓 Для учеников:
+• ✅ ДЗ выполнено - отметка выполнения
+• 📚 Мои ДЗ - список заданий
+• 🗓 Расписание - занятия
+
+🔔 Функции:
+• Автоматические напоминания
+• Уведомления репетитору
+• История заданий
+• Управление расписанием
+
+💡 Совет: Регулярно проверяйте ДЗ и расписание!
+"""
+
+    if update.message:
+        await update.message.reply_text(help_text)
+    elif update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(help_text)
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена"""
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "❌ Действие отменено.",
+            reply_markup=get_tutor_main_keyboard() if is_tutor(update.callback_query.from_user.id)
+            else get_student_main_keyboard()
+        )
+    elif update.message:
+        await update.message.reply_text(
+            "❌ Действие отменено.",
+            reply_markup=get_tutor_main_keyboard() if is_tutor(update.effective_user.id)
+            else get_student_main_keyboard()
+        )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик неизвестных сообщений"""
+    if update.message:
+        user_id = update.effective_user.id
+        if is_tutor(user_id):
+            await update.message.reply_text(
+                "Используйте /menu для управления.",
+                reply_markup=get_tutor_main_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                "Используйте кнопки ниже:",
+                reply_markup=get_student_main_keyboard()
+            )
+
+
+# ====================== КЛАВИАТУРЫ ======================
+def get_tutor_main_keyboard():
+    """Основная клавиатура репетитора"""
     keyboard = [
         [InlineKeyboardButton("📝 Добавить ДЗ", callback_data='tutor_add_hw')],
         [InlineKeyboardButton("📋 Список ДЗ", callback_data='tutor_list_hw')],
-        [InlineKeyboardButton("👥 Ученики", callback_data='tutor_students')],
+        [InlineKeyboardButton("📅 Добавить занятие", callback_data='tutor_add_lesson')],
+        [InlineKeyboardButton("🗓 Расписание", callback_data='tutor_list_lessons')],
+        [InlineKeyboardButton("👥 Ученики", callback_data='tutor_list_students')],
+        [InlineKeyboardButton("🔄 Обновить напоминания", callback_data='tutor_reminders')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_student_keyboard():
-    """Клавиатура для ученика"""
+def get_student_main_keyboard():
+    """Основная клавиатура ученика"""
     keyboard = [
         [InlineKeyboardButton("✅ ДЗ выполнено", callback_data='student_hw_done')],
-        [InlineKeyboardButton("📚 Мои задания", callback_data='student_my_hw')],
+        [InlineKeyboardButton("📚 Мои ДЗ", callback_data='student_my_hw')],
         [InlineKeyboardButton("🗓 Расписание", callback_data='student_schedule')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help')],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /help"""
-    await start(update, context)
-
-
-# ====================== ЗАПУСК БОТА (ИСПРАВЛЕННЫЙ) ======================
+# ====================== ЗАПУСК БОТА ======================
 def main():
-    """Главная функция (синхронная)"""
-    logger.info("=" * 50)
+    """Главная функция"""
+    global application
+
+    logger.info("=" * 60)
     logger.info("🚀 ЗАПУСК HELPER TUTOR BOT")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
 
     # Проверка токена
     if not TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
-        logger.info("💡 Как получить токен:")
-        logger.info("1. Найдите @BotFather в Telegram")
-        logger.info("2. Отправьте /newbot")
-        logger.info("3. Следуйте инструкциям")
-        logger.info("4. Скопируйте токен")
-        logger.info("5. На Render: TELEGRAM_BOT_TOKEN = ваш_токен")
+        logger.info("💡 Добавьте на Render: TELEGRAM_BOT_TOKEN = ваш_токен")
         return
 
-    logger.info(f"✅ Токен: установлен ({len(TOKEN)} символов)")
+    logger.info(f"✅ Токен: установлен")
     logger.info(f"✅ Репетитор ID: {TUTOR_ID if TUTOR_ID else 'не установлен'}")
 
-    # Для Windows нужно настроить event loop policy
+    # Для Windows
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     try:
         # Создаем приложение
-        app = Application.builder().token(TOKEN).build()
+        application = Application.builder().token(TOKEN).build()
+
+        # Conversation Handler для добавления ДЗ
+        conv_hw_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(tutor_select_student_hw, pattern='^select_student_hw:')],
+            states={
+                WAITING_HW_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_hw_text)],
+                WAITING_HW_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_hw_deadline)],
+            },
+            fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$')],
+        )
+
+        # Conversation Handler для добавления занятия
+        conv_lesson_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(tutor_select_student_lesson, pattern='^select_student_lesson:')],
+            states={
+                WAITING_LESSON_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_lesson_time)],
+                WAITING_LESSON_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_lesson_topic)],
+            },
+            fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$')],
+        )
 
         # Регистрируем обработчики
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CallbackQueryHandler(button_handler))
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("menu", menu))
+        application.add_handler(CommandHandler("help", help_command))
 
-        # Обработчик текста
-        app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            lambda update, ctx: update.message.reply_text(
-                "Используйте /start",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚀 Начать", callback_data='start')]
-                ])
-            )
-        ))
+        # Обработчики кнопок репетитора
+        application.add_handler(CallbackQueryHandler(tutor_add_hw_start, pattern='^tutor_add_hw$'))
+        application.add_handler(CallbackQueryHandler(tutor_list_hw, pattern='^tutor_list_hw$'))
+        application.add_handler(CallbackQueryHandler(tutor_add_lesson_start, pattern='^tutor_add_lesson$'))
+        application.add_handler(CallbackQueryHandler(tutor_list_lessons, pattern='^tutor_list_lessons$'))
+        application.add_handler(CallbackQueryHandler(tutor_list_students, pattern='^tutor_list_students$'))
+        application.add_handler(CallbackQueryHandler(tutor_reminders, pattern='^tutor_reminders$'))
+
+        # Обработчики кнопок ученика
+        application.add_handler(CallbackQueryHandler(student_hw_done, pattern='^student_hw_done$'))
+        application.add_handler(CallbackQueryHandler(student_my_hw, pattern='^student_my_hw$'))
+        application.add_handler(CallbackQueryHandler(student_schedule, pattern='^student_schedule$'))
+
+        # Conversation handlers
+        application.add_handler(conv_hw_handler)
+        application.add_handler(conv_lesson_handler)
+
+        # Общий обработчик кнопок
+        application.add_handler(CallbackQueryHandler(help_command, pattern='^help$'))
+        application.add_handler(CallbackQueryHandler(cancel, pattern='^cancel$'))
+
+        # Обработчик неизвестных сообщений
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
+
+        # Запускаем планировщик напоминаний
+        scheduler.start()
+        schedule_reminders()
 
         logger.info("✅ Обработчики зарегистрированы")
+        logger.info("✅ Планировщик запущен")
         logger.info("🤖 Бот запускается...")
 
         # Запускаем бота
-        app.run_polling()
+        application.run_polling()
 
     except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
+        logger.error(f"❌ Ошибка запуска: {e}", exc_info=True)
+        if 'scheduler' in locals():
+            scheduler.shutdown()
 
 
 if __name__ == '__main__':
-    main()  # Только main() без asyncio.run()
+    main()
