@@ -4,7 +4,9 @@ import logging
 import asyncio
 import signal
 import atexit
-import re
+import time
+import threading
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
@@ -18,7 +20,7 @@ try:
     HAS_AIOHTTP = True
 except ImportError:
     HAS_AIOHTTP = False
-    import threading
+    import socketserver
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -31,7 +33,7 @@ from telegram.ext import (
 load_dotenv()
 
 # Получаем порт из окружения (Render автоматически назначает PORT)
-PORT = int(os.getenv('PORT', 8080))
+PORT = int(os.getenv('PORT', 10000))
 
 # Состояния для ConversationHandler
 WAITING_HW_TEXT, WAITING_HW_DEADLINE, WAITING_HW_STUDENT, WAITING_LESSON_TIME, WAITING_LESSON_TOPIC, WAITING_LESSON_STUDENT = range(
@@ -52,18 +54,25 @@ def safe_getenv(key, default=None):
 TOKEN = safe_getenv('TELEGRAM_BOT_TOKEN')
 TUTOR_ID = int(safe_getenv('TUTOR_ID', '0') or 0)
 TIMEZONE = safe_getenv('TIMEZONE', 'Europe/Moscow')
+# Ключ для внешнего пинга (опционально)
+PING_KEY = safe_getenv('PING_KEY', '')
 
 # ====================== ЛОГИРОВАНИЕ ======================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
 # ====================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ======================
 application = None
 scheduler = None
-web_runner = None
+web_server_thread = None
+last_activity = datetime.now()
 
 # ====================== ХРАНИЛИЩЕ В ПАМЯТИ ======================
 users_db = {}  # telegram_id -> {id, username, full_name, role, created_at}
@@ -73,30 +82,171 @@ next_id = 1
 
 
 # ====================== ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECKS ======================
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
-    """Простой HTTP обработчик для health checks"""
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """HTTP обработчик для health checks и пингов"""
 
     def do_GET(self):
+        global last_activity
+
         if self.path == '/health' or self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
+
             status = {
                 'status': 'ok',
                 'timestamp': datetime.now().isoformat(),
                 'service': 'helper-tutor-bot',
+                'bot_status': 'running' if application and application.running else 'stopped',
+                'uptime': str(datetime.now() - start_time),
+                'last_activity': last_activity.isoformat(),
                 'stats': {
                     'users': len(users_db),
                     'homeworks': len(homeworks_db),
                     'lessons': len(lessons_db),
-                    'active_homeworks': len([h for h in homeworks_db if not h.get('is_completed')])
+                    'active_homeworks': len([h for h in homeworks_db if not h.get('is_completed')]),
+                    'scheduled_jobs': len(scheduler.get_jobs()) if scheduler else 0
                 }
             }
-            import json
-            self.wfile.write(json.dumps(status).encode())
+            self.wfile.write(json.dumps(status, indent=2).encode())
+
+        elif self.path.startswith('/ping'):
+            # Эндпоинт для внешнего пинга (чтобы сервис не засыпал)
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+
+            last_activity = datetime.now()
+
+            response = {
+                'pong': True,
+                'timestamp': last_activity.isoformat(),
+                'message': 'Service is alive'
+            }
+
+            # Проверка ключа, если установлен
+            if PING_KEY:
+                query_parts = self.path.split('?')
+                if len(query_parts) > 1:
+                    params = query_parts[1]
+                    if f'key={PING_KEY}' in params:
+                        response['authenticated'] = True
+                    else:
+                        response['authenticated'] = False
+                        response['message'] = 'Invalid key'
+
+            self.wfile.write(json.dumps(response).encode())
+
+        elif self.path == '/wakeup':
+            # Специальный эндпоинт для пробуждения
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+
+            last_activity = datetime.now()
+
+            response = {
+                'woke_up': True,
+                'timestamp': last_activity.isoformat(),
+                'message': 'Service awakened successfully'
+            }
+
+            # Пытаемся восстановить бота если он упал
+            if application and not application.running:
+                try:
+                    asyncio.run_coroutine_threadsafe(start_bot_async(), asyncio.get_event_loop())
+                    response['bot_restarted'] = True
+                except:
+                    response['bot_restarted'] = False
+
+            self.wfile.write(json.dumps(response).encode())
+
+        elif self.path == '/status':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Helper Tutor Bot Status</title>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <meta http-equiv="refresh" content="30">
+                <style>
+                    body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+                    .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }}
+                    .status {{ padding: 10px; margin: 10px 0; border-radius: 5px; }}
+                    .ok {{ background: #d4edda; color: #155724; }}
+                    .warning {{ background: #fff3cd; color: #856404; }}
+                    .error {{ background: #f8d7da; color: #721c24; }}
+                    .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }}
+                    .stat-box {{ background: #e9ecef; padding: 15px; border-radius: 5px; text-align: center; }}
+                    .stat-value {{ font-size: 24px; font-weight: bold; }}
+                    .stat-label {{ font-size: 12px; color: #6c757d; }}
+                    .last-active {{ margin-top: 20px; padding: 10px; background: #e7f1ff; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🤖 Helper Tutor Bot Status</h1>
+
+                    <div class="status ok">
+                        <h2>✅ Сервис работает</h2>
+                        <p>Время запуска: {start_time.strftime('%d.%m.%Y %H:%M:%S')}</p>
+                        <p>Аптайм: {str(datetime.now() - start_time).split('.')[0]}</p>
+                    </div>
+
+                    <div class="last-active">
+                        <h3>📊 Последняя активность</h3>
+                        <p>{last_activity.strftime('%d.%m.%Y %H:%M:%S')}</p>
+                        <p><small>Обновляется при каждом запросе к боту</small></p>
+                    </div>
+
+                    <div class="stats">
+                        <div class="stat-box">
+                            <div class="stat-value">{len(users_db)}</div>
+                            <div class="stat-label">Пользователей</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value">{len(homeworks_db)}</div>
+                            <div class="stat-label">Всего ДЗ</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value">{len([h for h in homeworks_db if not h.get('is_completed')])}</div>
+                            <div class="stat-label">Активных ДЗ</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-value">{len(lessons_db)}</div>
+                            <div class="stat-label">Занятий</div>
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 20px;">
+                        <h3>🔗 Полезные ссылки</h3>
+                        <ul>
+                            <li><a href="/health">Health Check (JSON)</a></li>
+                            <li><a href="/ping">Ping endpoint</a></li>
+                            <li><a href="/wakeup">Wake up service</a></li>
+                        </ul>
+                    </div>
+
+                    <div style="margin-top: 30px; font-size: 12px; color: #6c757d;">
+                        <p>Сервис автоматически обновляется каждые 30 секунд</p>
+                        <p>Последнее обновление: {datetime.now().strftime('%H:%M:%S')}</p>
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode())
+
         else:
             self.send_response(404)
+            self.send_header('Content-type', 'application/json')
             self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
 
     def log_message(self, format, *args):
         logger.debug(f"HTTP {self.address_string()} - {format % args}")
@@ -104,55 +254,126 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 
 def run_http_server():
     """Запуск HTTP сервера в отдельном потоке"""
-    server = HTTPServer(('0.0.0.0', PORT), SimpleHTTPRequestHandler)
-    logger.info(f"🌐 HTTP сервер запущен на порту {PORT}")
+    global web_server_thread
+
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        # Пытаемся использовать порт из окружения
+        port = int(os.getenv('PORT', 10000))
+
+        # Пробуем разные порты если основной занят
+        for p in [port, 8080, 8000, 5000, 3000]:
+            try:
+                server = HTTPServer(('0.0.0.0', p), HealthCheckHandler)
+                logger.info(f"🌐 HTTP сервер запущен на порту {p}")
+
+                # Сохраняем порт в глобальную переменную
+                global PORT
+                PORT = p
+
+                server.serve_forever()
+                break
+            except OSError as e:
+                if "Address already in use" in str(e):
+                    logger.warning(f"Порт {p} занят, пробую другой...")
+                    continue
+                else:
+                    raise e
+    except Exception as e:
+        logger.error(f"❌ Ошибка HTTP сервера: {e}")
     finally:
-        server.server_close()
+        if 'server' in locals():
+            server.server_close()
 
 
-async def start_web_server():
-    """Запуск веб-сервера (aiohttp если доступен, иначе простой HTTP)"""
-    global web_runner
+async def start_web_server_aiohttp():
+    """Запуск веб-сервера на aiohttp"""
+    global last_activity
 
-    if HAS_AIOHTTP:
-        # Используем aiohttp если установлен
-        app = web.Application()
+    app = web.Application()
 
-        async def health_check(request):
-            status = {
-                'status': 'ok',
-                'timestamp': datetime.now().isoformat(),
-                'service': 'helper-tutor-bot',
-                'stats': {
-                    'users': len(users_db),
-                    'homeworks': len(homeworks_db),
-                    'lessons': len(lessons_db),
-                    'active_homeworks': len([h for h in homeworks_db if not h.get('is_completed')])
-                }
+    async def health_check(request):
+        status = {
+            'status': 'ok',
+            'timestamp': datetime.now().isoformat(),
+            'service': 'helper-tutor-bot',
+            'bot_status': 'running' if application and application.running else 'stopped',
+            'uptime': str(datetime.now() - start_time),
+            'last_activity': last_activity.isoformat(),
+            'stats': {
+                'users': len(users_db),
+                'homeworks': len(homeworks_db),
+                'lessons': len(lessons_db),
+                'active_homeworks': len([h for h in homeworks_db if not h.get('is_completed')]),
+                'scheduled_jobs': len(scheduler.get_jobs()) if scheduler else 0
             }
-            return web.json_response(status)
+        }
+        return web.json_response(status)
 
-        app.router.add_get('/health', health_check)
-        app.router.add_get('/', health_check)
+    async def ping_handler(request):
+        last_activity = datetime.now()
+        response = {'pong': True, 'timestamp': last_activity.isoformat()}
+        return web.json_response(response)
 
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', PORT)
-        await site.start()
+    async def wakeup_handler(request):
+        last_activity = datetime.now()
+        response = {'woke_up': True, 'timestamp': last_activity.isoformat()}
+        return web.json_response(response)
 
-        web_runner = runner
-        logger.info(f"🌐 aiohttp сервер запущен на порту {PORT}")
-        return runner
-    else:
-        # Запускаем простой HTTP сервер в отдельном потоке
-        thread = threading.Thread(target=run_http_server, daemon=True)
-        thread.start()
-        logger.info(f"🌐 Простой HTTP сервер запущен на порту {PORT}")
-        return thread
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/', health_check)
+    app.router.add_get('/ping', ping_handler)
+    app.router.add_get('/wakeup', wakeup_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    # Пробуем разные порты
+    port = int(os.getenv('PORT', 10000))
+    for p in [port, 8080, 8000, 5000, 3000]:
+        try:
+            site = web.TCPSite(runner, '0.0.0.0', p)
+            await site.start()
+            logger.info(f"🌐 aiohttp сервер запущен на порту {p}")
+
+            global PORT
+            PORT = p
+            break
+        except OSError as e:
+            if "Address already in use" in str(e):
+                logger.warning(f"Порт {p} занят, пробую другой...")
+                continue
+            else:
+                raise e
+
+    return runner
+
+
+# ====================== АВТО-ПИНГ СИСТЕМА ======================
+async def auto_ping():
+    """Автоматический пинг для поддержания активности"""
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'http://localhost:{PORT}/ping') as resp:
+                if resp.status == 200:
+                    logger.debug("✅ Авто-пинг выполнен")
+                else:
+                    logger.warning(f"⚠️ Авто-пинг вернул статус {resp.status}")
+    except Exception as e:
+        logger.debug(f"Авто-пинг ошибка: {e}")
+
+
+def start_auto_ping():
+    """Запуск автоматического пинга каждые 10 минут"""
+
+    async def ping_job():
+        while True:
+            await asyncio.sleep(600)  # 10 минут
+            await auto_ping()
+
+    # Запускаем в отдельной задаче
+    asyncio.create_task(ping_job())
+    logger.info("✅ Авто-пинг система запущена (каждые 10 минут)")
 
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
@@ -226,9 +447,17 @@ def get_upcoming_lessons():
 # ====================== НАПОМИНАНИЯ ======================
 def schedule_reminders():
     """Запланировать напоминания для активных ДЗ и занятий"""
+    global last_activity
+    last_activity = datetime.now()
+
+    if not scheduler:
+        return
+
     # Сбрасываем старые задания
-    if scheduler:
+    try:
         scheduler.remove_all_jobs()
+    except:
+        pass
 
     now = datetime.now()
 
@@ -291,11 +520,16 @@ def schedule_reminders():
         except Exception as e:
             logger.error(f"Ошибка планирования напоминания занятия: {e}")
 
+    logger.info(f"✅ Напоминания запланированы: {len(scheduler.get_jobs())} заданий")
+
 
 async def send_reminder(chat_id: int, message: str):
     """Отправить напоминание"""
+    global last_activity
+    last_activity = datetime.now()
+
     try:
-        if application:
+        if application and application.bot:
             await application.bot.send_message(chat_id=chat_id, text=message)
             logger.info(f"Напоминание отправлено {chat_id}")
     except Exception as e:
@@ -305,6 +539,9 @@ async def send_reminder(chat_id: int, message: str):
 # ====================== КОМАНДЫ БОТА ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
+    global last_activity
+    last_activity = datetime.now()
+
     user = update.effective_user
     user_id = user.id
 
@@ -338,6 +575,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Меню репетитора"""
+    global last_activity
+    last_activity = datetime.now()
+
     if not is_tutor(update.effective_user.id):
         await update.message.reply_text("Доступно только репетитору!")
         return
@@ -350,6 +590,9 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def tutor_add_hw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начать добавление ДЗ"""
+    global last_activity
+    last_activity = datetime.now()
+
     if update.callback_query:
         await update.callback_query.answer()
         query = update.callback_query
@@ -389,6 +632,9 @@ async def tutor_add_hw_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def tutor_select_student_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбрать ученика для ДЗ"""
+    global last_activity
+    last_activity = datetime.now()
+
     query = update.callback_query
     await query.answer()
 
@@ -405,6 +651,9 @@ async def tutor_select_student_hw(update: Update, context: ContextTypes.DEFAULT_
 
 async def tutor_hw_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получить текст ДЗ"""
+    global last_activity
+    last_activity = datetime.now()
+
     text = update.message.text
     context.user_data['hw_text'] = text
 
@@ -418,6 +667,9 @@ async def tutor_hw_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def tutor_hw_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получить дедлайн ДЗ и сохранить"""
+    global last_activity
+    last_activity = datetime.now()
+
     deadline_str = update.message.text
     deadline = parse_datetime(deadline_str)
 
@@ -476,6 +728,9 @@ async def tutor_hw_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def tutor_list_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список ДЗ"""
+    global last_activity
+    last_activity = datetime.now()
+
     if update.callback_query:
         await update.callback_query.answer()
         query = update.callback_query
@@ -506,6 +761,9 @@ async def tutor_list_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def tutor_list_students(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список учеников"""
+    global last_activity
+    last_activity = datetime.now()
+
     if update.callback_query:
         await update.callback_query.answer()
         query = update.callback_query
@@ -534,6 +792,9 @@ async def tutor_list_students(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def tutor_add_lesson_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начать добавление занятия"""
+    global last_activity
+    last_activity = datetime.now()
+
     if update.callback_query:
         await update.callback_query.answer()
         query = update.callback_query
@@ -573,6 +834,9 @@ async def tutor_add_lesson_start(update: Update, context: ContextTypes.DEFAULT_T
 
 async def tutor_select_student_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбрать ученика для занятия"""
+    global last_activity
+    last_activity = datetime.now()
+
     query = update.callback_query
     await query.answer()
 
@@ -589,6 +853,9 @@ async def tutor_select_student_lesson(update: Update, context: ContextTypes.DEFA
 
 async def tutor_lesson_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получить время занятия"""
+    global last_activity
+    last_activity = datetime.now()
+
     time_str = update.message.text
     lesson_time = parse_datetime(time_str)
 
@@ -610,6 +877,9 @@ async def tutor_lesson_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def tutor_lesson_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получить тему занятия и сохранить"""
+    global last_activity
+    last_activity = datetime.now()
+
     topic = update.message.text if update.message.text != '-' else None
     student_id = context.user_data.get('selected_student')
     lesson_time = context.user_data.get('lesson_time')
@@ -661,6 +931,9 @@ async def tutor_lesson_topic(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def tutor_list_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список занятий"""
+    global last_activity
+    last_activity = datetime.now()
+
     if update.callback_query:
         await update.callback_query.answer()
         query = update.callback_query
@@ -691,6 +964,9 @@ async def tutor_list_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def tutor_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Управление напоминаниями"""
+    global last_activity
+    last_activity = datetime.now()
+
     schedule_reminders()
 
     if update.callback_query:
@@ -708,6 +984,9 @@ async def tutor_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def student_hw_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ученик отмечает ДЗ выполненным"""
+    global last_activity
+    last_activity = datetime.now()
+
     user_id = update.effective_user.id
 
     # Находим активные ДЗ для ученика
@@ -754,6 +1033,9 @@ async def student_hw_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def student_my_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Мои ДЗ"""
+    global last_activity
+    last_activity = datetime.now()
+
     user_id = update.effective_user.id
 
     all_hws = [h for h in homeworks_db if h['student_id'] == user_id]
@@ -792,6 +1074,9 @@ async def student_my_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def student_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Мое расписание"""
+    global last_activity
+    last_activity = datetime.now()
+
     user_id = update.effective_user.id
 
     student_lessons = [l for l in lessons_db if l['student_id'] == user_id]
@@ -830,6 +1115,9 @@ async def student_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Справка"""
+    global last_activity
+    last_activity = datetime.now()
+
     help_text = """
 📚 HelperTutor - Бот-помощник репетитора
 
@@ -860,8 +1148,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text(help_text)
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статус бота"""
+    global last_activity
+    last_activity = datetime.now()
+
+    status_text = f"""
+📊 Статус бота HelperTutor
+
+🔄 Бот работает
+⏱ Аптайм: {str(datetime.now() - start_time).split('.')[0]}
+📅 Запущен: {start_time.strftime('%d.%m.%Y %H:%M:%S')}
+👤 Пользователей: {len(users_db)}
+📝 ДЗ: {len(homeworks_db)} ({len([h for h in homeworks_db if not h.get('is_completed')])} активных)
+🗓 Занятий: {len(lessons_db)}
+🔔 Напоминаний: {len(scheduler.get_jobs()) if scheduler else 0}
+🌐 Порт: {PORT}
+"""
+    await update.message.reply_text(status_text)
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отмена"""
+    global last_activity
+    last_activity = datetime.now()
+
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(
@@ -882,6 +1193,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик неизвестных сообщений"""
+    global last_activity
+    last_activity = datetime.now()
+
     if update.message:
         user_id = update.effective_user.id
         if is_tutor(user_id):
@@ -941,87 +1255,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# ====================== GRACEFUL SHUTDOWN ======================
-def shutdown_handler(signum=None, frame=None):
-    """Обработчик завершения работы"""
-    logger.info("🚫 Получен сигнал завершения...")
-
-    global scheduler, application, web_runner
-
-    # Останавливаем планировщик
-    if scheduler and scheduler.running:
-        scheduler.shutdown()
-        logger.info("✅ Планировщик остановлен")
-
-    # Останавливаем бота
-    if application:
-        try:
-            # Останавливаем polling
-            if application.updater and application.updater.running:
-                application.updater.stop()
-
-            # Останавливаем application
-            application.stop()
-            application.shutdown()
-            logger.info("✅ Бот остановлен")
-        except Exception as e:
-            logger.error(f"❌ Ошибка при остановке бота: {e}")
-
-    # Останавливаем веб-сервер
-    if HAS_AIOHTTP and web_runner:
-        try:
-            import asyncio as async_lib
-            loop = async_lib.new_event_loop()
-            async_lib.set_event_loop(loop)
-            loop.run_until_complete(web_runner.cleanup())
-            logger.info("✅ Веб-сервер остановлен")
-        except Exception as e:
-            logger.error(f"❌ Ошибка при остановке веб-сервера: {e}")
-
-    logger.info("👋 Бот завершил работу")
-    sys.exit(0)
-
-
-def register_shutdown_handlers():
-    """Регистрация обработчиков завершения"""
-    # Для Ctrl+C
-    signal.signal(signal.SIGINT, shutdown_handler)
-
-    # Для системных сигналов
-    if hasattr(signal, 'SIGTERM'):
-        signal.signal(signal.SIGTERM, shutdown_handler)
-
-    # При выходе
-    atexit.register(shutdown_handler)
-
-
-# ====================== ОСНОВНАЯ ФУНКЦИЯ ======================
-async def main_async():
-    """Асинхронная основная функция"""
+# ====================== ЗАПУСК БОТА ======================
+async def start_bot_async():
+    """Асинхронный запуск бота"""
     global application, scheduler
 
-    logger.info("=" * 60)
-    logger.info("🚀 ЗАПУСК HELPER TUTOR BOT")
-    logger.info("=" * 60)
-
-    # Проверка токена
-    if not TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
-        logger.info("💡 Добавьте на Render: TELEGRAM_BOT_TOKEN = ваш_токен")
-        return
-
-    logger.info(f"✅ Токен: установлен")
-    logger.info(f"✅ Репетитор ID: {TUTOR_ID if TUTOR_ID else 'не установлен'}")
-    logger.info(f"✅ Порт веб-сервера: {PORT}")
-
-    # Запускаем веб-сервер для health checks
-    await start_web_server()
-
     try:
-        # Для Windows
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
         # Создаем приложение
         application = Application.builder().token(TOKEN).build()
 
@@ -1056,6 +1295,7 @@ async def main_async():
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("menu", menu))
         application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("status", status_command))
 
         # Обработчики кнопок репетитора
         application.add_handler(CallbackQueryHandler(tutor_add_hw_start, pattern='^tutor_add_hw$'))
@@ -1096,35 +1336,120 @@ async def main_async():
 
         logger.info("✅ Бот успешно запущен!")
         logger.info("👉 Напишите боту /start в Telegram")
-        logger.info(f"🌐 Health check доступен по адресу: http://0.0.0.0:{PORT}/health")
 
-        # Бесконечный цикл чтобы приложение не завершалось
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска бота: {e}", exc_info=True)
+        return False
+
+
+# ====================== GRACEFUL SHUTDOWN ======================
+def shutdown_handler(signum=None, frame=None):
+    """Обработчик завершения работы"""
+    logger.info("🚫 Получен сигнал завершения...")
+
+    global application, scheduler, web_server_thread
+
+    # Останавливаем планировщик
+    if scheduler and scheduler.running:
+        scheduler.shutdown()
+        logger.info("✅ Планировщик остановлен")
+
+    # Останавливаем бота
+    if application:
+        try:
+            # Останавливаем polling
+            if application.updater and application.updater.running:
+                application.updater.stop()
+
+            # Останавливаем application
+            application.stop()
+            application.shutdown()
+            logger.info("✅ Бот остановлен")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при остановке бота: {e}")
+
+    logger.info("👋 Бот завершил работу")
+    sys.exit(0)
+
+
+def register_shutdown_handlers():
+    """Регистрация обработчиков завершения"""
+    # Для Ctrl+C
+    signal.signal(signal.SIGINT, shutdown_handler)
+
+    # Для системных сигналов
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, shutdown_handler)
+
+    # При выходе
+    atexit.register(shutdown_handler)
+
+
+# ====================== ОСНОВНАЯ ФУНКЦИЯ ======================
+start_time = datetime.now()
+
+
+async def main_async():
+    """Асинхронная основная функция"""
+    global web_server_thread
+
+    logger.info("=" * 60)
+    logger.info("🚀 ЗАПУСК HELPER TUTOR BOT")
+    logger.info("=" * 60)
+
+    # Проверка токена
+    if not TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
+        logger.info("💡 Добавьте на Render: TELEGRAM_BOT_TOKEN = ваш_токен")
+        return
+
+    logger.info(f"✅ Токен: установлен")
+    logger.info(f"✅ Репетитор ID: {TUTOR_ID if TUTOR_ID else 'не установлен'}")
+    logger.info(f"✅ Временная зона: {TIMEZONE}")
+
+    # Запускаем веб-сервер в отдельном потоке
+    if HAS_AIOHTTP:
+        # Используем aiohttp
+        web_server_task = asyncio.create_task(start_web_server_aiohttp())
+    else:
+        # Используем простой HTTP сервер в отдельном потоке
+        web_server_thread = threading.Thread(target=run_http_server, daemon=True)
+        web_server_thread.start()
+        logger.info("🌐 HTTP сервер запущен в отдельном потоке")
+
+    # Ждем немного чтобы сервер успел запуститься
+    await asyncio.sleep(2)
+
+    # Запускаем авто-пинг систему
+    start_auto_ping()
+
+    # Запускаем бота
+    bot_started = await start_bot_async()
+
+    if not bot_started:
+        logger.error("❌ Не удалось запустить бота")
+        return
+
+    logger.info(f"🌐 Health check доступен по адресу: http://0.0.0.0:{PORT}/health")
+    logger.info(f"📊 Статус доступен по адресу: http://0.0.0.0:{PORT}/status")
+    logger.info("⏰ Для предотвращения засыпания используйте внешний пинг сервис")
+
+    # Бесконечный цикл чтобы приложение не завершалось
+    try:
         while True:
             await asyncio.sleep(3600)  # Спим 1 час
-
     except asyncio.CancelledError:
         logger.info("🛑 Получен сигнал отмены")
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
-    finally:
-        # Останавливаем бота
-        if application:
-            try:
-                await application.updater.stop()
-                await application.stop()
-                await application.shutdown()
-                logger.info("✅ Бот остановлен")
-            except Exception as e:
-                logger.error(f"❌ Ошибка при остановке бота: {e}")
-
-        # Останавливаем планировщик
-        if scheduler and scheduler.running:
-            scheduler.shutdown()
-            logger.info("✅ Планировщик остановлен")
 
 
 def main():
     """Точка входа"""
+    # Для Windows
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     # Регистрируем обработчики завершения
     register_shutdown_handlers()
 
