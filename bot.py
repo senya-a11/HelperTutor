@@ -4,13 +4,11 @@ import logging
 import asyncio
 import signal
 import atexit
-import time
-import threading
 import json
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, List, Any
 from dotenv import load_dotenv
-from pytz import timezone
+from pytz import timezone, all_timezones, utc
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Импорт для веб-сервера
@@ -20,7 +18,7 @@ try:
     HAS_AIOHTTP = True
 except ImportError:
     HAS_AIOHTTP = False
-    import socketserver
+    import threading
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -33,11 +31,13 @@ from telegram.ext import (
 load_dotenv()
 
 # Получаем порт из окружения (Render автоматически назначает PORT)
-PORT = int(os.getenv('PORT', 10000))
+PORT = int(os.getenv('PORT', 8080))
 
 # Состояния для ConversationHandler
-WAITING_HW_TEXT, WAITING_HW_DEADLINE, WAITING_HW_STUDENT, WAITING_LESSON_TIME, WAITING_LESSON_TOPIC, WAITING_LESSON_STUDENT = range(
-    6)
+(WAITING_HW_TEXT, WAITING_HW_DEADLINE, WAITING_HW_STUDENT,
+ WAITING_LESSON_TIME, WAITING_LESSON_TOPIC, WAITING_LESSON_STUDENT,
+ WAITING_DELETE_STUDENT, WAITING_SETTINGS_CHOICE, WAITING_NOTIFICATION_SETTINGS,
+ WAITING_LIVES_SETTINGS, WAITING_TIMEZONE_SETTINGS) = range(11)
 
 
 # Безопасное получение переменных
@@ -54,326 +54,43 @@ def safe_getenv(key, default=None):
 TOKEN = safe_getenv('TELEGRAM_BOT_TOKEN')
 TUTOR_ID = int(safe_getenv('TUTOR_ID', '0') or 0)
 TIMEZONE = safe_getenv('TIMEZONE', 'Europe/Moscow')
-# Ключ для внешнего пинга (опционально)
-PING_KEY = safe_getenv('PING_KEY', '')
 
 # ====================== ЛОГИРОВАНИЕ ======================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot.log')
-    ]
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # ====================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ======================
 application = None
 scheduler = None
-web_server_thread = None
-last_activity = datetime.now()
+web_runner = None
 
 # ====================== ХРАНИЛИЩЕ В ПАМЯТИ ======================
-users_db = {}  # telegram_id -> {id, username, full_name, role, created_at}
-homeworks_db = []  # [{id, student_id, tutor_id, task_text, deadline, is_completed, completed_at}]
-lessons_db = []  # [{id, student_id, tutor_id, lesson_time, topic, notify_student}]
+users_db = {}  # telegram_id -> user_data
+homeworks_db = []  # список домашних заданий
+lessons_db = []  # список занятий
 next_id = 1
-
-
-# ====================== ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECKS ======================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    """HTTP обработчик для health checks и пингов"""
-
-    def do_GET(self):
-        global last_activity
-
-        if self.path == '/health' or self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-
-            status = {
-                'status': 'ok',
-                'timestamp': datetime.now().isoformat(),
-                'service': 'helper-tutor-bot',
-                'bot_status': 'running' if application and application.running else 'stopped',
-                'uptime': str(datetime.now() - start_time),
-                'last_activity': last_activity.isoformat(),
-                'stats': {
-                    'users': len(users_db),
-                    'homeworks': len(homeworks_db),
-                    'lessons': len(lessons_db),
-                    'active_homeworks': len([h for h in homeworks_db if not h.get('is_completed')]),
-                    'scheduled_jobs': len(scheduler.get_jobs()) if scheduler else 0
-                }
-            }
-            self.wfile.write(json.dumps(status, indent=2).encode())
-
-        elif self.path.startswith('/ping'):
-            # Эндпоинт для внешнего пинга (чтобы сервис не засыпал)
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-
-            last_activity = datetime.now()
-
-            response = {
-                'pong': True,
-                'timestamp': last_activity.isoformat(),
-                'message': 'Service is alive'
-            }
-
-            # Проверка ключа, если установлен
-            if PING_KEY:
-                query_parts = self.path.split('?')
-                if len(query_parts) > 1:
-                    params = query_parts[1]
-                    if f'key={PING_KEY}' in params:
-                        response['authenticated'] = True
-                    else:
-                        response['authenticated'] = False
-                        response['message'] = 'Invalid key'
-
-            self.wfile.write(json.dumps(response).encode())
-
-        elif self.path == '/wakeup':
-            # Специальный эндпоинт для пробуждения
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-
-            last_activity = datetime.now()
-
-            response = {
-                'woke_up': True,
-                'timestamp': last_activity.isoformat(),
-                'message': 'Service awakened successfully'
-            }
-
-            # Пытаемся восстановить бота если он упал
-            if application and not application.running:
-                try:
-                    asyncio.run_coroutine_threadsafe(start_bot_async(), asyncio.get_event_loop())
-                    response['bot_restarted'] = True
-                except:
-                    response['bot_restarted'] = False
-
-            self.wfile.write(json.dumps(response).encode())
-
-        elif self.path == '/status':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-
-            html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Helper Tutor Bot Status</title>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta http-equiv="refresh" content="30">
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
-                    .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }}
-                    .status {{ padding: 10px; margin: 10px 0; border-radius: 5px; }}
-                    .ok {{ background: #d4edda; color: #155724; }}
-                    .warning {{ background: #fff3cd; color: #856404; }}
-                    .error {{ background: #f8d7da; color: #721c24; }}
-                    .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }}
-                    .stat-box {{ background: #e9ecef; padding: 15px; border-radius: 5px; text-align: center; }}
-                    .stat-value {{ font-size: 24px; font-weight: bold; }}
-                    .stat-label {{ font-size: 12px; color: #6c757d; }}
-                    .last-active {{ margin-top: 20px; padding: 10px; background: #e7f1ff; }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>🤖 Helper Tutor Bot Status</h1>
-
-                    <div class="status ok">
-                        <h2>✅ Сервис работает</h2>
-                        <p>Время запуска: {start_time.strftime('%d.%m.%Y %H:%M:%S')}</p>
-                        <p>Аптайм: {str(datetime.now() - start_time).split('.')[0]}</p>
-                    </div>
-
-                    <div class="last-active">
-                        <h3>📊 Последняя активность</h3>
-                        <p>{last_activity.strftime('%d.%m.%Y %H:%M:%S')}</p>
-                        <p><small>Обновляется при каждом запросе к боту</small></p>
-                    </div>
-
-                    <div class="stats">
-                        <div class="stat-box">
-                            <div class="stat-value">{len(users_db)}</div>
-                            <div class="stat-label">Пользователей</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value">{len(homeworks_db)}</div>
-                            <div class="stat-label">Всего ДЗ</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value">{len([h for h in homeworks_db if not h.get('is_completed')])}</div>
-                            <div class="stat-label">Активных ДЗ</div>
-                        </div>
-                        <div class="stat-box">
-                            <div class="stat-value">{len(lessons_db)}</div>
-                            <div class="stat-label">Занятий</div>
-                        </div>
-                    </div>
-
-                    <div style="margin-top: 20px;">
-                        <h3>🔗 Полезные ссылки</h3>
-                        <ul>
-                            <li><a href="/health">Health Check (JSON)</a></li>
-                            <li><a href="/ping">Ping endpoint</a></li>
-                            <li><a href="/wakeup">Wake up service</a></li>
-                        </ul>
-                    </div>
-
-                    <div style="margin-top: 30px; font-size: 12px; color: #6c757d;">
-                        <p>Сервис автоматически обновляется каждые 30 секунд</p>
-                        <p>Последнее обновление: {datetime.now().strftime('%H:%M:%S')}</p>
-                    </div>
-                </div>
-            </body>
-            </html>
-            """
-            self.wfile.write(html.encode())
-
-        else:
-            self.send_response(404)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
-
-    def log_message(self, format, *args):
-        logger.debug(f"HTTP {self.address_string()} - {format % args}")
-
-
-def run_http_server():
-    """Запуск HTTP сервера в отдельном потоке"""
-    global web_server_thread
-
-    try:
-        # Пытаемся использовать порт из окружения
-        port = int(os.getenv('PORT', 10000))
-
-        # Пробуем разные порты если основной занят
-        for p in [port, 8080, 8000, 5000, 3000]:
-            try:
-                server = HTTPServer(('0.0.0.0', p), HealthCheckHandler)
-                logger.info(f"🌐 HTTP сервер запущен на порту {p}")
-
-                # Сохраняем порт в глобальную переменную
-                global PORT
-                PORT = p
-
-                server.serve_forever()
-                break
-            except OSError as e:
-                if "Address already in use" in str(e):
-                    logger.warning(f"Порт {p} занят, пробую другой...")
-                    continue
-                else:
-                    raise e
-    except Exception as e:
-        logger.error(f"❌ Ошибка HTTP сервера: {e}")
-    finally:
-        if 'server' in locals():
-            server.server_close()
-
-
-async def start_web_server_aiohttp():
-    """Запуск веб-сервера на aiohttp"""
-    global last_activity
-
-    app = web.Application()
-
-    async def health_check(request):
-        status = {
-            'status': 'ok',
-            'timestamp': datetime.now().isoformat(),
-            'service': 'helper-tutor-bot',
-            'bot_status': 'running' if application and application.running else 'stopped',
-            'uptime': str(datetime.now() - start_time),
-            'last_activity': last_activity.isoformat(),
-            'stats': {
-                'users': len(users_db),
-                'homeworks': len(homeworks_db),
-                'lessons': len(lessons_db),
-                'active_homeworks': len([h for h in homeworks_db if not h.get('is_completed')]),
-                'scheduled_jobs': len(scheduler.get_jobs()) if scheduler else 0
-            }
-        }
-        return web.json_response(status)
-
-    async def ping_handler(request):
-        last_activity = datetime.now()
-        response = {'pong': True, 'timestamp': last_activity.isoformat()}
-        return web.json_response(response)
-
-    async def wakeup_handler(request):
-        last_activity = datetime.now()
-        response = {'woke_up': True, 'timestamp': last_activity.isoformat()}
-        return web.json_response(response)
-
-    app.router.add_get('/health', health_check)
-    app.router.add_get('/', health_check)
-    app.router.add_get('/ping', ping_handler)
-    app.router.add_get('/wakeup', wakeup_handler)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    # Пробуем разные порты
-    port = int(os.getenv('PORT', 10000))
-    for p in [port, 8080, 8000, 5000, 3000]:
-        try:
-            site = web.TCPSite(runner, '0.0.0.0', p)
-            await site.start()
-            logger.info(f"🌐 aiohttp сервер запущен на порту {p}")
-
-            global PORT
-            PORT = p
-            break
-        except OSError as e:
-            if "Address already in use" in str(e):
-                logger.warning(f"Порт {p} занят, пробую другой...")
-                continue
-            else:
-                raise e
-
-    return runner
-
-
-# ====================== АВТО-ПИНГ СИСТЕМА ======================
-async def auto_ping():
-    """Автоматический пинг для поддержания активности"""
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f'http://localhost:{PORT}/ping') as resp:
-                if resp.status == 200:
-                    logger.debug("✅ Авто-пинг выполнен")
-                else:
-                    logger.warning(f"⚠️ Авто-пинг вернул статус {resp.status}")
-    except Exception as e:
-        logger.debug(f"Авто-пинг ошибка: {e}")
-
-
-def start_auto_ping():
-    """Запуск автоматического пинга каждые 10 минут"""
-
-    async def ping_job():
-        while True:
-            await asyncio.sleep(600)  # 10 минут
-            await auto_ping()
-
-    # Запускаем в отдельной задаче
-    asyncio.create_task(ping_job())
-    logger.info("✅ Авто-пинг система запущена (каждые 10 минут)")
+settings_db = {
+    'notifications': {
+        'homework_reminders': True,
+        'lesson_reminders': True,
+        'late_homework_alerts': True,
+        'homework_24h': True,
+        'homework_1h': True,
+        'lesson_1h': True
+    },
+    'lives_system': {
+        'enabled': True,
+        'max_lives': 5,
+        'penalty_for_late_hw': 1,
+        'penalty_for_missed_lesson': 2,
+        'reward_for_early_hw': 1,
+        'auto_reset_days': 7
+    },
+    'timezone': TIMEZONE
+}
 
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
@@ -395,7 +112,10 @@ def register_user(telegram_id: int, username: str, full_name: str, role: str = '
             'username': username,
             'full_name': full_name,
             'role': role,
-            'created_at': datetime.now().isoformat()
+            'created_at': datetime.now().isoformat(),
+            'lives': settings_db['lives_system']['max_lives'],
+            'last_life_reset': datetime.now().isoformat(),
+            'timezone': settings_db['timezone']
         }
         return True
     return False
@@ -408,21 +128,60 @@ def is_tutor(telegram_id: int) -> bool:
     return telegram_id == TUTOR_ID
 
 
-def format_datetime(dt_str):
+def get_local_time(dt_str=None, user_tz=None):
+    """Конвертирует время в локальное время пользователя"""
     try:
-        dt = datetime.fromisoformat(dt_str)
-        return dt.strftime('%d.%m.%Y %H:%M')
-    except:
-        return dt_str
+        if dt_str is None:
+            dt = datetime.now()
+        else:
+            dt = datetime.fromisoformat(dt_str)
+
+        # Используем таймзону пользователя или дефолтную
+        tz = timezone(user_tz or settings_db['timezone'])
+        local_dt = dt.astimezone(tz)
+        return local_dt.strftime('%d.%m.%Y %H:%M')
+    except Exception as e:
+        logger.error(f"Ошибка конвертации времени: {e}")
+        if dt_str:
+            try:
+                dt = datetime.fromisoformat(dt_str)
+                return dt.strftime('%d.%m.%Y %H:%M')
+            except:
+                return dt_str
+        return datetime.now().strftime('%d.%m.%Y %H:%M')
 
 
-def parse_datetime(dt_str):
+def parse_datetime(dt_str, user_tz=None):
+    """Парсит дату с учетом таймзоны пользователя"""
     try:
-        return datetime.strptime(dt_str, '%d.%m.%Y %H:%M')
+        # Парсим как локальное время
+        dt = datetime.strptime(dt_str, '%d.%m.%Y %H:%M')
+
+        # Если указана таймзона пользователя, применяем ее
+        if user_tz:
+            tz = timezone(user_tz)
+            dt = tz.localize(dt)
+        else:
+            # Иначе используем дефолтную таймзону
+            tz = timezone(settings_db['timezone'])
+            dt = tz.localize(dt)
+
+        # Конвертируем в UTC для хранения
+        dt_utc = dt.astimezone(utc)
+        return dt_utc
     except ValueError:
         try:
-            return datetime.strptime(dt_str, '%d.%m.%Y')
-        except:
+            dt = datetime.strptime(dt_str, '%d.%m.%Y')
+            if user_tz:
+                tz = timezone(user_tz)
+                dt = tz.localize(dt.replace(hour=23, minute=59))
+            else:
+                tz = timezone(settings_db['timezone'])
+                dt = tz.localize(dt.replace(hour=23, minute=59))
+            dt_utc = dt.astimezone(utc)
+            return dt_utc
+        except Exception as e:
+            logger.error(f"Ошибка парсинга даты: {e}")
             return None
 
 
@@ -435,101 +194,303 @@ def get_homeworks_for_student(student_id):
 
 
 def get_active_homeworks():
-    now = datetime.now().isoformat()
-    return [h for h in homeworks_db if h['deadline'] > now and not h.get('is_completed')]
+    now_utc = datetime.now(utc).isoformat()
+    return [h for h in homeworks_db if h['deadline'] > now_utc and not h.get('is_completed')]
+
+
+def get_late_homeworks():
+    now_utc = datetime.now(utc).isoformat()
+    late_hws = []
+    for hw in homeworks_db:
+        if hw['deadline'] < now_utc and not hw.get('is_completed') and not hw.get('late_notified'):
+            late_hws.append(hw)
+    return late_hws
 
 
 def get_upcoming_lessons():
-    now = datetime.now().isoformat()
-    return [l for l in lessons_db if l['lesson_time'] > now]
+    now_utc = datetime.now(utc).isoformat()
+    return [l for l in lessons_db if l['lesson_time'] > now_utc]
 
 
-# ====================== НАПОМИНАНИЯ ======================
+def update_lives(student_id: int, delta: int):
+    """Обновляет количество жизней ученика"""
+    student = get_user(student_id)
+    if student and settings_db['lives_system']['enabled']:
+        current_lives = student.get('lives', settings_db['lives_system']['max_lives'])
+        new_lives = max(0, min(current_lives + delta, settings_db['lives_system']['max_lives']))
+        student['lives'] = new_lives
+
+        # Отправляем уведомление при изменении жизней
+        if delta < 0:
+            try:
+                asyncio.create_task(
+                    application.bot.send_message(
+                        chat_id=student_id,
+                        text=f"⚠️ Снято {-delta} жизней! Осталось: {new_lives}/{settings_db['lives_system']['max_lives']}"
+                    )
+                )
+            except:
+                pass
+
+        return new_lives
+    return None
+
+
+def check_and_reset_lives():
+    """Проверяет и сбрасывает жизни по расписанию"""
+    now = datetime.now(utc)
+    for user in users_db.values():
+        if user.get('role') == 'student':
+            last_reset_str = user.get('last_life_reset')
+            if last_reset_str:
+                try:
+                    last_reset = datetime.fromisoformat(last_reset_str).astimezone(utc)
+                    days_passed = (now - last_reset).days
+                    if days_passed >= settings_db['lives_system']['auto_reset_days']:
+                        user['lives'] = settings_db['lives_system']['max_lives']
+                        user['last_life_reset'] = now.isoformat()
+
+                        # Уведомляем ученика
+                        try:
+                            asyncio.create_task(
+                                application.bot.send_message(
+                                    chat_id=user['telegram_id'],
+                                    text=f"🎉 Жизни сброшены! Теперь у вас {settings_db['lives_system']['max_lives']}/{settings_db['lives_system']['max_lives']} жизней."
+                                )
+                            )
+                        except:
+                            pass
+                except:
+                    pass
+
+
+# ====================== ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECKS ======================
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    """Простой HTTP обработчик для health checks"""
+
+    def do_GET(self):
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            health_data = {
+                'status': 'healthy',
+                'timestamp': datetime.now().isoformat(),
+                'users_count': len(users_db),
+                'homeworks_count': len(homeworks_db),
+                'lessons_count': len(lessons_db)
+            }
+            self.wfile.write(json.dumps(health_data).encode())
+        elif self.path == '/stats':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            stats = {
+                'users': len(users_db),
+                'students': len(get_students()),
+                'active_homeworks': len(get_active_homeworks()),
+                'upcoming_lessons': len(get_upcoming_lessons()),
+                'late_homeworks': len(get_late_homeworks())
+            }
+            self.wfile.write(json.dumps(stats).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        logger.info(f"HTTP {self.address_string()} - {format % args}")
+
+
+def run_http_server():
+    """Запуск HTTP сервера в отдельном потоке"""
+    server = HTTPServer(('0.0.0.0', PORT), SimpleHTTPRequestHandler)
+    logger.info(f"🌐 HTTP сервер запущен на порту {PORT}")
+    server.serve_forever()
+
+
+async def start_web_server():
+    """Запуск веб-сервера (aiohttp если доступен, иначе простой HTTP)"""
+    global web_runner
+
+    if HAS_AIOHTTP:
+        # Используем aiohttp если установлен
+        app = web.Application()
+
+        async def health_check(request):
+            return web.json_response({
+                'status': 'healthy',
+                'timestamp': datetime.now().isoformat(),
+                'service': 'HelperTutor Bot'
+            })
+
+        async def stats_check(request):
+            return web.json_response({
+                'users': len(users_db),
+                'students': len(get_students()),
+                'active_homeworks': len(get_active_homeworks()),
+                'upcoming_lessons': len(get_upcoming_lessons()),
+                'settings': settings_db
+            })
+
+        app.router.add_get('/health', health_check)
+        app.router.add_get('/', health_check)
+        app.router.add_get('/stats', stats_check)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
+
+        web_runner = runner
+        logger.info(f"🌐 aiohttp сервер запущен на порту {PORT}")
+        return runner
+    else:
+        # Запускаем простой HTTP сервер в отдельном потоке
+        thread = threading.Thread(target=run_http_server, daemon=True)
+        thread.start()
+        logger.info(f"🌐 Простой HTTP сервер запущен на порту {PORT}")
+        return thread
+
+
+# ====================== НАПОМИНАНИЯ И УВЕДОМЛЕНИЯ ======================
 def schedule_reminders():
     """Запланировать напоминания для активных ДЗ и занятий"""
-    global last_activity
-    last_activity = datetime.now()
-
     if not scheduler:
         return
 
-    # Сбрасываем старые задания
-    try:
-        scheduler.remove_all_jobs()
-    except:
-        pass
+    scheduler.remove_all_jobs()
 
-    now = datetime.now()
+    now_utc = datetime.now(utc)
 
-    # Напоминания о ДЗ
-    for hw in get_active_homeworks():
+    # Запланировать проверку просроченных ДЗ каждые 6 часов
+    scheduler.add_job(
+        check_late_homeworks,
+        'interval',
+        hours=6,
+        id='check_late_homeworks'
+    )
+
+    # Запланировать сброс жизней каждые 24 часа
+    scheduler.add_job(
+        check_and_reset_lives,
+        'interval',
+        hours=24,
+        id='reset_lives_check'
+    )
+
+    # Напоминания о ДЗ (если включены в настройках)
+    if settings_db['notifications']['homework_reminders']:
+        for hw in get_active_homeworks():
+            try:
+                deadline = datetime.fromisoformat(hw['deadline']).astimezone(utc)
+                student = get_user(hw['student_id'])
+
+                if not student:
+                    continue
+
+                # Получаем таймзону ученика
+                student_tz = student.get('timezone', settings_db['timezone'])
+
+                # За 24 часа (если включено)
+                if settings_db['notifications']['homework_24h']:
+                    reminder_24h = deadline - timedelta(hours=24)
+                    if reminder_24h > now_utc:
+                        scheduler.add_job(
+                            send_reminder,
+                            'date',
+                            run_date=reminder_24h,
+                            args=[student['telegram_id'],
+                                  f"⏰ Напоминание: ДЗ через 24 часа!\n📝 {hw['task_text'][:50]}...\n📅 Дедлайн: {get_local_time(hw['deadline'], student_tz)}"],
+                            id=f"hw_24h_{hw['id']}"
+                        )
+
+                # За 1 час (если включено)
+                if settings_db['notifications']['homework_1h']:
+                    reminder_1h = deadline - timedelta(hours=1)
+                    if reminder_1h > now_utc:
+                        scheduler.add_job(
+                            send_reminder,
+                            'date',
+                            run_date=reminder_1h,
+                            args=[student['telegram_id'],
+                                  f"⏰ СРОЧНО: ДЗ через 1 час!\n📝 {hw['task_text'][:50]}..."],
+                            id=f"hw_1h_{hw['id']}"
+                        )
+            except Exception as e:
+                logger.error(f"Ошибка планирования напоминания ДЗ: {e}")
+
+    # Напоминания о занятиях (если включены)
+    if settings_db['notifications']['lesson_reminders']:
+        for lesson in get_upcoming_lessons():
+            try:
+                lesson_time = datetime.fromisoformat(lesson['lesson_time']).astimezone(utc)
+                student = get_user(lesson['student_id'])
+
+                if not student:
+                    continue
+
+                # Получаем таймзону ученика
+                student_tz = student.get('timezone', settings_db['timezone'])
+
+                # За 1 час (если включено)
+                if settings_db['notifications']['lesson_1h']:
+                    reminder_1h = lesson_time - timedelta(hours=1)
+                    if reminder_1h > now_utc:
+                        topic = f" по теме: {lesson['topic']}" if lesson.get('topic') else ""
+                        scheduler.add_job(
+                            send_reminder,
+                            'date',
+                            run_date=reminder_1h,
+                            args=[student['telegram_id'],
+                                  f"👨‍🏫 Напоминание: занятие через 1 час{topic}\n🕐 Начало: {get_local_time(lesson['lesson_time'], student_tz)}"],
+                            id=f"lesson_{lesson['id']}"
+                        )
+            except Exception as e:
+                logger.error(f"Ошибка планирования напоминания занятия: {e}")
+
+
+async def check_late_homeworks():
+    """Проверка просроченных ДЗ и отправка уведомлений"""
+    late_hws = get_late_homeworks()
+
+    for hw in late_hws:
         try:
-            deadline = datetime.fromisoformat(hw['deadline'])
             student = get_user(hw['student_id'])
+            tutor = get_user(hw['tutor_id'])
 
-            if not student:
+            if not student or not tutor:
                 continue
 
-            # За 24 часа
-            reminder_24h = deadline - timedelta(hours=24)
-            if reminder_24h > now:
-                scheduler.add_job(
-                    send_reminder,
-                    'date',
-                    run_date=reminder_24h,
-                    args=[student['telegram_id'],
-                          f"⏰ Напоминание: ДЗ через 24 часа!\n📝 {hw['task_text'][:50]}...\n📅 Дедлайн: {format_datetime(hw['deadline'])}"],
-                    id=f"hw_24h_{hw['id']}"
+            # Отмечаем как уведомленное
+            hw['late_notified'] = True
+
+            # Если включены уведомления о просрочках
+            if settings_db['notifications']['late_homework_alerts']:
+                # Уведомляем репетитора
+                await application.bot.send_message(
+                    chat_id=tutor['telegram_id'],
+                    text=f"⚠️ ПРОСРОЧКА ДЗ!\n\n👤 Ученик: {student['full_name']}\n📝 {hw['task_text'][:100]}...\n📅 Был дедлайн: {get_local_time(hw['deadline'])}"
                 )
 
-            # За 1 час
-            reminder_1h = deadline - timedelta(hours=1)
-            if reminder_1h > now:
-                scheduler.add_job(
-                    send_reminder,
-                    'date',
-                    run_date=reminder_1h,
-                    args=[student['telegram_id'],
-                          f"⏰ СРОЧНО: ДЗ через 1 час!\n📝 {hw['task_text'][:50]}..."],
-                    id=f"hw_1h_{hw['id']}"
+            # Если включена система жизней
+            if settings_db['lives_system']['enabled']:
+                penalty = settings_db['lives_system']['penalty_for_late_hw']
+                new_lives = update_lives(student['telegram_id'], -penalty)
+
+                # Уведомляем репетитора о снятии жизней
+                await application.bot.send_message(
+                    chat_id=tutor['telegram_id'],
+                    text=f"👤 {student['full_name']} потерял {penalty} жизней за просрочку ДЗ\nОсталось жизней: {new_lives}"
                 )
+
         except Exception as e:
-            logger.error(f"Ошибка планирования напоминания ДЗ: {e}")
-
-    # Напоминания о занятиях
-    for lesson in get_upcoming_lessons():
-        try:
-            lesson_time = datetime.fromisoformat(lesson['lesson_time'])
-            student = get_user(lesson['student_id'])
-
-            if not student or not lesson.get('notify_student', True):
-                continue
-
-            # За 1 час
-            reminder_1h = lesson_time - timedelta(hours=1)
-            if reminder_1h > now:
-                topic = f" по теме: {lesson['topic']}" if lesson.get('topic') else ""
-                scheduler.add_job(
-                    send_reminder,
-                    'date',
-                    run_date=reminder_1h,
-                    args=[student['telegram_id'],
-                          f"👨‍🏫 Напоминание: занятие через 1 час{topic}\n🕐 Начало: {format_datetime(lesson['lesson_time'])}"],
-                    id=f"lesson_{lesson['id']}"
-                )
-        except Exception as e:
-            logger.error(f"Ошибка планирования напоминания занятия: {e}")
-
-    logger.info(f"✅ Напоминания запланированы: {len(scheduler.get_jobs())} заданий")
+            logger.error(f"Ошибка обработки просроченного ДЗ: {e}")
 
 
 async def send_reminder(chat_id: int, message: str):
     """Отправить напоминание"""
-    global last_activity
-    last_activity = datetime.now()
-
     try:
-        if application and application.bot:
+        if application:
             await application.bot.send_message(chat_id=chat_id, text=message)
             logger.info(f"Напоминание отправлено {chat_id}")
     except Exception as e:
@@ -539,9 +500,6 @@ async def send_reminder(chat_id: int, message: str):
 # ====================== КОМАНДЫ БОТА ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
-    global last_activity
-    last_activity = datetime.now()
-
     user = update.effective_user
     user_id = user.id
 
@@ -551,6 +509,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👨‍🏫 Добро пожаловать, репетитор {user.full_name}!
 
 Ваш ID: {user.id}
+Ваша таймзона: {settings_db['timezone']}
+Текущее время: {get_local_time()}
+
 Используйте /menu для управления
 """
         reply_markup = get_tutor_main_keyboard()
@@ -560,6 +521,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👨‍🎓 Привет, {user.full_name}!
 
 Я бот-помощник репетитора HelperTutor.
+
+📊 Ваши жизни: {settings_db['lives_system']['max_lives']}/{settings_db['lives_system']['max_lives']}
+🕐 Текущее время: {get_local_time()}
 
 Я помогу вам:
 • Следить за домашними заданиями
@@ -575,773 +539,780 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Меню репетитора"""
-    global last_activity
-    last_activity = datetime.now()
-
     if not is_tutor(update.effective_user.id):
         await update.message.reply_text("Доступно только репетитору!")
         return
 
+    user_tz = settings_db['timezone']
+    current_time = get_local_time()
+
     await update.message.reply_text(
-        "📊 Панель управления репетитора:",
+        f"📊 Панель управления репетитора\n\n"
+        f"🕐 Таймзона: {user_tz}\n"
+        f"⏰ Текущее время: {current_time}\n\n"
+        f"👥 Учеников: {len(get_students())}\n"
+        f"📚 Активных ДЗ: {len(get_active_homeworks())}\n"
+        f"🗓 Занятий: {len(get_upcoming_lessons())}",
         reply_markup=get_tutor_main_keyboard()
     )
 
 
 async def tutor_add_hw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начать добавление ДЗ"""
-    global last_activity
-    last_activity = datetime.now()
-
-    if update.callback_query:
-        await update.callback_query.answer()
-        query = update.callback_query
-        user_id = query.from_user.id
-    else:
-        user_id = update.effective_user.id
-
-    if not is_tutor(user_id):
-        if update.callback_query:
-            await query.edit_message_text("Доступно только репетитору!")
-        return
+    await update.callback_query.answer()
 
     students = get_students()
     if not students:
-        await update.callback_query.edit_message_text(
-            "Нет зарегистрированных учеников.",
-            reply_markup=get_tutor_main_keyboard()
-        )
+        await update.callback_query.edit_message_text("Нет учеников.", reply_markup=get_tutor_main_keyboard())
         return ConversationHandler.END
 
-    keyboard = []
-    for student in students:
-        keyboard.append([InlineKeyboardButton(
-            f"👤 {student['full_name']}",
-            callback_data=f"select_student_hw:{student['telegram_id']}"
-        )])
+    keyboard = [[InlineKeyboardButton(f"👤 {s['full_name']} ({s.get('lives', 0)}❤️)",
+                                      callback_data=f"hw_student:{s['telegram_id']}")] for s in students]
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
-    if update.callback_query:
-        await query.edit_message_text(
-            "👥 Выберите ученика для ДЗ:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
+    await update.callback_query.edit_message_text(
+        "Выберите ученика для ДЗ:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     return WAITING_HW_STUDENT
 
 
 async def tutor_select_student_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбрать ученика для ДЗ"""
-    global last_activity
-    last_activity = datetime.now()
-
+    """Выбрать ученика"""
     query = update.callback_query
     await query.answer()
 
     student_id = int(query.data.split(':')[1])
     context.user_data['selected_student'] = student_id
 
-    await query.edit_message_text(
-        "✏️ Введите текст домашнего задания:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
-    )
-
+    await query.edit_message_text("Введите текст ДЗ:", reply_markup=InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]]))
     return WAITING_HW_TEXT
 
 
 async def tutor_hw_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получить текст ДЗ"""
-    global last_activity
-    last_activity = datetime.now()
+    """Текст ДЗ"""
+    context.user_data['hw_text'] = update.message.text
 
-    text = update.message.text
-    context.user_data['hw_text'] = text
+    # Получаем таймзону ученика для корректного отображения
+    student_id = context.user_data['selected_student']
+    student = get_user(student_id)
+    student_tz = student.get('timezone', settings_db['timezone'])
 
     await update.message.reply_text(
-        "📅 Введите дедлайн (формат: ДД.ММ.ГГГГ ЧЧ:ММ):",
-        reply_markup=ReplyKeyboardRemove()
+        f"Введите дедлайн (ДД.ММ.ГГГГ ЧЧ:ММ)\n"
+        f"Таймзона ученика: {student_tz}\n"
+        f"Пример: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     )
-
     return WAITING_HW_DEADLINE
 
 
 async def tutor_hw_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получить дедлайн ДЗ и сохранить"""
-    global last_activity
-    last_activity = datetime.now()
+    """Дедлайн ДЗ"""
+    student_id = context.user_data['selected_student']
+    student = get_user(student_id)
+    student_tz = student.get('timezone', settings_db['timezone'])
 
-    deadline_str = update.message.text
-    deadline = parse_datetime(deadline_str)
-
+    deadline = parse_datetime(update.message.text, student_tz)
     if not deadline:
-        await update.message.reply_text(
-            "❌ Неверный формат! Используйте ДД.ММ.ГГГГ ЧЧ:ММ\nПопробуйте еще раз:"
-        )
+        await update.message.reply_text("Неверный формат! Используйте ДД.ММ.ГГГГ ЧЧ:ММ\nПопробуйте снова:")
         return WAITING_HW_DEADLINE
 
-    student_id = context.user_data.get('selected_student')
-    hw_text = context.user_data.get('hw_text')
-    tutor_id = update.effective_user.id
+    hw_text = context.user_data['hw_text']
 
-    if not all([student_id, hw_text, tutor_id]):
-        await update.message.reply_text("❌ Ошибка данных. Начните заново.")
-        return ConversationHandler.END
-
-    # Сохраняем ДЗ
     hw_id = get_next_id()
     homeworks_db.append({
         'id': hw_id,
         'student_id': student_id,
-        'tutor_id': tutor_id,
+        'tutor_id': update.effective_user.id,
         'task_text': hw_text,
         'deadline': deadline.isoformat(),
         'is_completed': False,
-        'completed_at': None,
-        'created_at': datetime.now().isoformat()
+        'late_notified': False,
+        'created_at': datetime.now(utc).isoformat()
     })
 
-    # Обновляем напоминания
-    schedule_reminders()
-
-    # Отправляем уведомление ученику
-    student = get_user(student_id)
-    if student:
-        try:
-            await update._bot.send_message(
-                chat_id=student_id,
-                text=f"📚 Новое домашнее задание!\n\n📝 {hw_text}\n📅 Дедлайн: {deadline_str}\n\nНажмите '✅ ДЗ выполнено' когда выполните."
-            )
-        except:
-            pass
-
     await update.message.reply_text(
-        f"✅ ДЗ успешно добавлено для {student['full_name'] if student else 'ученика'}!\n"
-        f"Дедлайн: {deadline_str}",
+        f"✅ ДЗ добавлено для {student['full_name']}!\n"
+        f"📅 Дедлайн: {get_local_time(deadline.isoformat(), student_tz)}\n"
+        f"⏰ По таймзоне: {student_tz}",
         reply_markup=get_tutor_main_keyboard()
     )
 
-    # Очищаем временные данные
     context.user_data.clear()
-
+    schedule_reminders()
     return ConversationHandler.END
 
 
 async def tutor_list_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список ДЗ"""
-    global last_activity
-    last_activity = datetime.now()
+    active = get_active_homeworks()
 
-    if update.callback_query:
-        await update.callback_query.answer()
-        query = update.callback_query
+    if not active:
+        text = "📭 Нет активных ДЗ."
     else:
-        query = None
-
-    active_hws = get_active_homeworks()
-
-    if not active_hws:
-        text = "📭 Нет активных домашних заданий."
-    else:
-        text = "📚 Активные домашние задания:\n\n"
-        for hw in active_hws[:10]:  # Показываем первые 10
+        text = "📚 Активные ДЗ:\n\n"
+        for hw in active[:10]:
             student = get_user(hw['student_id'])
-            tutor = get_user(hw['tutor_id'])
-            status = "✅ Выполнено" if hw.get('is_completed') else "⏳ В процессе"
-            text += f"👤 Ученик: {student['full_name'] if student else 'Неизвестен'}\n"
-            text += f"👨‍🏫 Репетитор: {tutor['full_name'] if tutor else 'Неизвестен'}\n"
+            student_tz = student.get('timezone', settings_db['timezone']) if student else settings_db['timezone']
+            text += f"👤 {student['full_name'] if student else '???'} ({student.get('lives', 0)}❤️)\n"
             text += f"📝 {hw['task_text'][:50]}...\n"
-            text += f"📅 Дедлайн: {format_datetime(hw['deadline'])}\n"
-            text += f"{status}\n\n"
+            text += f"📅 {get_local_time(hw['deadline'], student_tz)}\n"
+            text += f"⏰ Таймзона: {student_tz}\n\n"
 
-    if query:
-        await query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
-    else:
-        await update.message.reply_text(text, reply_markup=get_tutor_main_keyboard())
+    await update.callback_query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
 
 
 async def tutor_list_students(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список учеников"""
-    global last_activity
-    last_activity = datetime.now()
-
-    if update.callback_query:
-        await update.callback_query.answer()
-        query = update.callback_query
-    else:
-        query = None
-
+    """Список учеников с жизнями"""
     students = get_students()
 
     if not students:
-        text = "👥 Нет зарегистрированных учеников."
+        text = "👥 Нет учеников."
     else:
-        text = f"👥 Список учеников ({len(students)}):\n\n"
-        for student in students:
-            username = f"(@{student['username']})" if student['username'] else ""
-            hws = get_homeworks_for_student(student['telegram_id'])
-            completed = len(
-                [h for h in homeworks_db if h['student_id'] == student['telegram_id'] and h.get('is_completed')])
-            text += f"• {student['full_name']} {username}\n"
-            text += f"  📊 Активных ДЗ: {len(hws)}, Выполнено: {completed}\n\n"
+        text = f"👥 Ученики ({len(students)}):\n\n"
+        for s in students:
+            active_hws = len(get_homeworks_for_student(s['telegram_id']))
+            completed_hws = len(
+                [h for h in homeworks_db if h['student_id'] == s['telegram_id'] and h.get('is_completed')])
+            text += f"• {s['full_name']}\n"
+            text += f"  ❤️ Жизни: {s.get('lives', 0)}/{settings_db['lives_system']['max_lives']}\n"
+            text += f"  📊 ДЗ: {active_hws} активных, {completed_hws} выполнено\n"
+            text += f"  🕐 Таймзона: {s.get('timezone', 'Не указана')}\n\n"
 
-    if query:
-        await query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
-    else:
-        await update.message.reply_text(text, reply_markup=get_tutor_main_keyboard())
+    await update.callback_query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
 
 
-async def tutor_add_lesson_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начать добавление занятия"""
-    global last_activity
-    last_activity = datetime.now()
-
-    if update.callback_query:
-        await update.callback_query.answer()
-        query = update.callback_query
-        user_id = query.from_user.id
-    else:
-        user_id = update.effective_user.id
-
-    if not is_tutor(user_id):
-        if update.callback_query:
-            await query.edit_message_text("Доступно только репетитору!")
-        return
+async def tutor_delete_student_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать удаление ученика"""
+    await update.callback_query.answer()
 
     students = get_students()
     if not students:
-        await update.callback_query.edit_message_text(
-            "Нет зарегистрированных учеников.",
-            reply_markup=get_tutor_main_keyboard()
-        )
+        await update.callback_query.edit_message_text("Нет учеников.", reply_markup=get_tutor_main_keyboard())
         return ConversationHandler.END
 
-    keyboard = []
-    for student in students:
-        keyboard.append([InlineKeyboardButton(
-            f"👤 {student['full_name']}",
-            callback_data=f"select_student_lesson:{student['telegram_id']}"
-        )])
+    keyboard = [[InlineKeyboardButton(f"🗑 {s['full_name']}",
+                                      callback_data=f"delete_student:{s['telegram_id']}")] for s in students]
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
-    if update.callback_query:
-        await query.edit_message_text(
-            "👥 Выберите ученика для занятия:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    return WAITING_LESSON_STUDENT
+    await update.callback_query.edit_message_text(
+        "Выберите ученика для удаления:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_DELETE_STUDENT
 
 
-async def tutor_select_student_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбрать ученика для занятия"""
-    global last_activity
-    last_activity = datetime.now()
-
+async def tutor_delete_student_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение удаления ученика"""
     query = update.callback_query
     await query.answer()
 
     student_id = int(query.data.split(':')[1])
-    context.user_data['selected_student'] = student_id
+    student = get_user(student_id)
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete:{student_id}")],
+        [InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel")]
+    ]
 
     await query.edit_message_text(
-        "🕐 Введите дату и время занятия (формат: ДД.ММ.ГГГГ ЧЧ:ММ):",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+        f"⚠️ ВНИМАНИЕ! Вы собираетесь удалить ученика:\n\n"
+        f"👤 {student['full_name']}\n"
+        f"📱 ID: {student_id}\n"
+        f"📊 Активных ДЗ: {len(get_homeworks_for_student(student_id))}\n\n"
+        f"Все его данные (ДЗ, занятия) будут удалены!\n"
+        f"Вы уверены?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+    return ConversationHandler.END
 
-    return WAITING_LESSON_TIME
 
+async def tutor_delete_student_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполнить удаление ученика"""
+    query = update.callback_query
+    await query.answer()
 
-async def tutor_lesson_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получить время занятия"""
-    global last_activity
-    last_activity = datetime.now()
+    student_id = int(query.data.split(':')[1])
+    student = get_user(student_id)
 
-    time_str = update.message.text
-    lesson_time = parse_datetime(time_str)
+    if student:
+        # Удаляем ученика
+        del users_db[student_id]
 
-    if not lesson_time:
-        await update.message.reply_text(
-            "❌ Неверный формат! Используйте ДД.ММ.ГГГГ ЧЧ:ММ\nПопробуйте еще раз:"
+        # Удаляем его ДЗ
+        global homeworks_db
+        homeworks_db = [h for h in homeworks_db if h['student_id'] != student_id]
+
+        # Удаляем его занятия
+        global lessons_db
+        lessons_db = [l for l in lessons_db if l['student_id'] != student_id]
+
+        await query.edit_message_text(
+            f"✅ Ученик {student['full_name']} удален!\n"
+            f"🗑 Удалены все связанные данные.",
+            reply_markup=get_tutor_main_keyboard()
         )
-        return WAITING_LESSON_TIME
+    else:
+        await query.edit_message_text("❌ Ученик не найден.", reply_markup=get_tutor_main_keyboard())
 
-    context.user_data['lesson_time'] = lesson_time.isoformat()
 
-    await update.message.reply_text(
-        "📌 Введите тему занятия (или отправьте '-' чтобы пропустить):",
-        reply_markup=ReplyKeyboardRemove()
+async def tutor_settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройки репетитора"""
+    await update.callback_query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("🔔 Настройки уведомлений", callback_data="settings_notifications")],
+        [InlineKeyboardButton("❤️ Система жизней", callback_data="settings_lives")],
+        [InlineKeyboardButton("🕐 Настройки времени", callback_data="settings_time")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="settings_stats")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="cancel")]
+    ]
+
+    await update.callback_query.edit_message_text(
+        f"⚙️ Настройки репетитора\n\n"
+        f"📊 Текущие настройки:\n"
+        f"• 🔔 Уведомления: {'Вкл' if settings_db['notifications']['homework_reminders'] else 'Выкл'}\n"
+        f"• ❤️ Система жизней: {'Вкл' if settings_db['lives_system']['enabled'] else 'Выкл'}\n"
+        f"• 🕐 Таймзона: {settings_db['timezone']}\n",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+    return WAITING_SETTINGS_CHOICE
 
-    return WAITING_LESSON_TOPIC
+
+async def tutor_settings_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройки уведомлений"""
+    await update.callback_query.answer()
+
+    notifications = settings_db['notifications']
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'🔔' if notifications['homework_reminders'] else '🔕'} Уведомления о ДЗ: {'Вкл' if notifications['homework_reminders'] else 'Выкл'}",
+            callback_data="toggle_hw_reminders"
+        )],
+        [InlineKeyboardButton(
+            f"{'🔔' if notifications['lesson_reminders'] else '🔕'} Уведомления о занятиях: {'Вкл' if notifications['lesson_reminders'] else 'Выкл'}",
+            callback_data="toggle_lesson_reminders"
+        )],
+        [InlineKeyboardButton(
+            f"{'🔔' if notifications['late_homework_alerts'] else '🔕'} Оповещения о просрочках: {'Вкл' if notifications['late_homework_alerts'] else 'Выкл'}",
+            callback_data="toggle_late_alerts"
+        )],
+        [InlineKeyboardButton(
+            f"{'🔔' if notifications['homework_24h'] else '🔕'} Напоминания за 24ч: {'Вкл' if notifications['homework_24h'] else 'Выкл'}",
+            callback_data="toggle_hw_24h"
+        )],
+        [InlineKeyboardButton(
+            f"{'🔔' if notifications['homework_1h'] else '🔕'} Напоминания за 1ч: {'Вкл' if notifications['homework_1h'] else 'Выкл'}",
+            callback_data="toggle_hw_1h"
+        )],
+        [InlineKeyboardButton(
+            f"{'🔔' if notifications['lesson_1h'] else '🔕'} Напоминания о занятиях: {'Вкл' if notifications['lesson_1h'] else 'Выкл'}",
+            callback_data="toggle_lesson_1h"
+        )],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")]
+    ]
+
+    await update.callback_query.edit_message_text(
+        "🔔 Настройки уведомлений:\n\n"
+        "Вы можете включать/выключать различные типы уведомлений.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_NOTIFICATION_SETTINGS
 
 
-async def tutor_lesson_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получить тему занятия и сохранить"""
-    global last_activity
-    last_activity = datetime.now()
+async def toggle_notification_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключение настройки уведомлений"""
+    query = update.callback_query
+    await query.answer()
 
-    topic = update.message.text if update.message.text != '-' else None
-    student_id = context.user_data.get('selected_student')
-    lesson_time = context.user_data.get('lesson_time')
-    tutor_id = update.effective_user.id
+    setting_map = {
+        'toggle_hw_reminders': ('homework_reminders', 'Уведомления о ДЗ'),
+        'toggle_lesson_reminders': ('lesson_reminders', 'Уведомления о занятиях'),
+        'toggle_late_alerts': ('late_homework_alerts', 'Оповещения о просрочках'),
+        'toggle_hw_24h': ('homework_24h', 'Напоминания за 24ч'),
+        'toggle_hw_1h': ('homework_1h', 'Напоминания за 1ч'),
+        'toggle_lesson_1h': ('lesson_1h', 'Напоминания о занятиях')
+    }
 
-    if not all([student_id, lesson_time, tutor_id]):
-        await update.message.reply_text("❌ Ошибка данных. Начните заново.")
-        return ConversationHandler.END
+    setting_key, setting_name = setting_map[query.data]
+    settings_db['notifications'][setting_key] = not settings_db['notifications'][setting_key]
 
-    # Сохраняем занятие
-    lesson_id = get_next_id()
-    lessons_db.append({
-        'id': lesson_id,
-        'student_id': student_id,
-        'tutor_id': tutor_id,
-        'lesson_time': lesson_time,
-        'topic': topic,
-        'notify_student': True,
-        'created_at': datetime.now().isoformat()
-    })
+    new_state = 'Вкл' if settings_db['notifications'][setting_key] else 'Выкл'
+    await query.answer(f"{setting_name}: {new_state}", show_alert=True)
 
-    # Обновляем напоминания
+    # Обновляем напоминания при изменении настроек
     schedule_reminders()
 
-    # Отправляем уведомление ученику
-    student = get_user(student_id)
-    if student:
-        try:
-            await update._bot.send_message(
-                chat_id=student_id,
-                text=f"📅 Новое занятие!\n\n🕐 {format_datetime(lesson_time)}\n"
-                     f"📌 Тема: {topic if topic else 'Не указана'}"
-            )
-        except:
-            pass
+    # Возвращаемся к настройкам уведомлений
+    await tutor_settings_notifications(update, context)
 
-    await update.message.reply_text(
-        f"✅ Занятие успешно добавлено для {student['full_name'] if student else 'ученика'}!\n"
-        f"Время: {format_datetime(lesson_time)}\n"
-        f"Тема: {topic if topic else 'Не указана'}",
+
+async def tutor_settings_lives(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройки системы жизней"""
+    await update.callback_query.answer()
+
+    lives_settings = settings_db['lives_system']
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'❤️' if lives_settings['enabled'] else '💔'} Система жизней: {'Вкл' if lives_settings['enabled'] else 'Выкл'}",
+            callback_data="toggle_lives_system"
+        )],
+        [InlineKeyboardButton(
+            f"🔢 Макс. жизней: {lives_settings['max_lives']}",
+            callback_data="set_max_lives"
+        )],
+        [InlineKeyboardButton(
+            f"➖ Штраф за просрочку: {lives_settings['penalty_for_late_hw']}",
+            callback_data="set_penalty_late"
+        )],
+        [InlineKeyboardButton(
+            f"➖ Штраф за пропуск занятия: {lives_settings['penalty_for_missed_lesson']}",
+            callback_data="set_penalty_lesson"
+        )],
+        [InlineKeyboardButton(
+            f"➕ Награда за раннее ДЗ: {lives_settings['reward_for_early_hw']}",
+            callback_data="set_reward_early"
+        )],
+        [InlineKeyboardButton(
+            f"🔄 Авто-сброс дней: {lives_settings['auto_reset_days']}",
+            callback_data="set_reset_days"
+        )],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")]
+    ]
+
+    await update.callback_query.edit_message_text(
+        "❤️ Настройки системы жизней:\n\n"
+        "Система жизней мотивирует учеников выполнять задания вовремя.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_LIVES_SETTINGS
+
+
+async def toggle_lives_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включение/выключение системы жизней"""
+    query = update.callback_query
+    await query.answer()
+
+    settings_db['lives_system']['enabled'] = not settings_db['lives_system']['enabled']
+    new_state = 'Вкл' if settings_db['lives_system']['enabled'] else 'Выкл'
+
+    await query.answer(f"Система жизней: {new_state}", show_alert=True)
+    await tutor_settings_lives(update, context)
+
+
+async def tutor_settings_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройки времени"""
+    await update.callback_query.answer()
+
+    # Создаем клавиатуру с популярными таймзонами России и СНГ
+    popular_timezones = [
+        'Europe/Moscow',  # Москва
+        'Europe/Kaliningrad',  # Калининград
+        'Europe/Samara',  # Самара
+        'Asia/Yekaterinburg',  # Екатеринбург
+        'Asia/Omsk',  # Омск
+        'Asia/Krasnoyarsk',  # Красноярск
+        'Asia/Irkutsk',  # Иркутск
+        'Asia/Yakutsk',  # Якутск
+        'Asia/Vladivostok',  # Владивосток
+        'Europe/Kiev',  # Киев
+        'Europe/Minsk',  # Минск
+        'Asia/Almaty',  # Алматы
+    ]
+
+    keyboard = []
+    for tz in popular_timezones:
+        display_name = tz.split('/')[-1].replace('_', ' ')
+        if tz == settings_db['timezone']:
+            keyboard.append([InlineKeyboardButton(f"✅ {display_name}", callback_data=f"timezone:{tz}")])
+        else:
+            keyboard.append([InlineKeyboardButton(f"   {display_name}", callback_data=f"timezone:{tz}")])
+
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")])
+
+    current_time = get_local_time()
+
+    await update.callback_query.edit_message_text(
+        f"🕐 Настройки времени\n\n"
+        f"Текущая таймзона: {settings_db['timezone']}\n"
+        f"Текущее время: {current_time}\n\n"
+        f"Выберите таймзону:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_TIMEZONE_SETTINGS
+
+
+async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Установка таймзоны"""
+    query = update.callback_query
+    await query.answer()
+
+    new_timezone = query.data.split(':')[1]
+    settings_db['timezone'] = new_timezone
+
+    # Обновляем время для всех пользователей
+    for user in users_db.values():
+        if user.get('role') == 'student' and not user.get('timezone'):
+            user['timezone'] = new_timezone
+
+    current_time = get_local_time()
+
+    await query.edit_message_text(
+        f"✅ Таймзона изменена на: {new_timezone}\n"
+        f"🕐 Текущее время: {current_time}",
         reply_markup=get_tutor_main_keyboard()
     )
 
-    # Очищаем временные данные
-    context.user_data.clear()
+    # Обновляем напоминания с новой таймзоной
+    schedule_reminders()
 
     return ConversationHandler.END
 
 
-async def tutor_list_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список занятий"""
-    global last_activity
-    last_activity = datetime.now()
+async def tutor_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика"""
+    await update.callback_query.answer()
 
-    if update.callback_query:
-        await update.callback_query.answer()
-        query = update.callback_query
-    else:
-        query = None
-
+    students = get_students()
+    active_hws = get_active_homeworks()
     upcoming_lessons = get_upcoming_lessons()
+    late_hws = get_late_homeworks()
 
-    if not upcoming_lessons:
-        text = "🗓 Нет запланированных занятий."
-    else:
-        text = "🗓 Ближайшие занятия:\n\n"
-        for lesson in upcoming_lessons[:10]:  # Показываем первые 10
-            student = get_user(lesson['student_id'])
-            tutor = get_user(lesson['tutor_id'])
-            notify = "🔔" if lesson.get('notify_student', True) else "🔕"
-            text += f"👤 Ученик: {student['full_name'] if student else 'Неизвестен'}\n"
-            text += f"👨‍🏫 Репетитор: {tutor['full_name'] if tutor else 'Неизвестен'}\n"
-            text += f"🕐 {format_datetime(lesson['lesson_time'])}\n"
-            text += f"📌 Тема: {lesson.get('topic', 'Не указана')}\n"
-            text += f"{notify} Уведомления\n\n"
+    # Статистика по жизням
+    lives_stats = {
+        'full': sum(1 for s in students if s.get('lives', 0) == settings_db['lives_system']['max_lives']),
+        'half': sum(1 for s in students if 0 < s.get('lives', 0) < settings_db['lives_system']['max_lives']),
+        'zero': sum(1 for s in students if s.get('lives', 0) == 0),
+    }
 
-    if query:
-        await query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
-    else:
-        await update.message.reply_text(text, reply_markup=get_tutor_main_keyboard())
+    text = f"📊 Статистика системы\n\n"
+    text += f"👥 Учеников: {len(students)}\n"
+    text += f"📚 Активных ДЗ: {len(active_hws)}\n"
+    text += f"⚠️ Просроченных ДЗ: {len(late_hws)}\n"
+    text += f"🗓 Ближайших занятий: {len(upcoming_lessons)}\n\n"
 
+    if settings_db['lives_system']['enabled']:
+        text += f"❤️ Статистика жизней:\n"
+        text += f"• Полные жизни: {lives_stats['full']}\n"
+        text += f"• Частичные: {lives_stats['half']}\n"
+        text += f"• Нет жизней: {lives_stats['zero']}\n\n"
 
-async def tutor_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Управление напоминаниями"""
-    global last_activity
-    last_activity = datetime.now()
+    text += f"🕐 Таймзона: {settings_db['timezone']}\n"
+    text += f"🔔 Уведомления: {'Вкл' if settings_db['notifications']['homework_reminders'] else 'Выкл'}\n"
+    text += f"❤️ Система жизней: {'Вкл' if settings_db['lives_system']['enabled'] else 'Выкл'}"
 
-    schedule_reminders()
-
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            "🔄 Напоминания обновлены!",
-            reply_markup=get_tutor_main_keyboard()
-        )
-    else:
-        await update.message.reply_text(
-            "🔄 Напоминания обновлены!",
-            reply_markup=get_tutor_main_keyboard()
-        )
+    await update.callback_query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
 
 
 async def student_hw_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ученик отмечает ДЗ выполненным"""
-    global last_activity
-    last_activity = datetime.now()
-
+    """Ученик отмечает ДЗ"""
     user_id = update.effective_user.id
-
-    # Находим активные ДЗ для ученика
-    student_hws = get_homeworks_for_student(user_id)
+    student_hws = [h for h in homeworks_db if h['student_id'] == user_id and not h.get('is_completed')]
 
     if not student_hws:
-        if update.callback_query:
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text(
-                "📭 У вас нет активных домашних заданий.",
-                reply_markup=get_student_main_keyboard()
-            )
+        await update.callback_query.edit_message_text("📭 Нет активных ДЗ.", reply_markup=get_student_main_keyboard())
         return
 
-    # Берем первое невыполненное ДЗ
-    hw = student_hws[0]
-    hw['is_completed'] = True
-    hw['completed_at'] = datetime.now().isoformat()
+    # Создаем клавиатуру с выбором ДЗ
+    keyboard = []
+    for hw in student_hws[:5]:  # Показываем до 5 ДЗ
+        deadline = datetime.fromisoformat(hw['deadline']).astimezone(utc)
+        now = datetime.now(utc)
+        is_early = deadline > now
 
-    # Отправляем уведомление репетитору
-    tutor = get_user(hw['tutor_id'])
+        emoji = "✅" if is_early else "⚠️"
+        status = " (досрочно)" if is_early else " (с опозданием)"
+
+        keyboard.append([InlineKeyboardButton(
+            f"{emoji} {hw['task_text'][:30]}...{status}",
+            callback_data=f"complete_hw:{hw['id']}"
+        )])
+
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+
     student = get_user(user_id)
+    await update.callback_query.edit_message_text(
+        f"📚 Выберите ДЗ для отметки:\n\n"
+        f"❤️ Ваши жизни: {student.get('lives', 0)}/{settings_db['lives_system']['max_lives']}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-    if tutor and TUTOR_ID:
-        try:
-            await update._bot.send_message(
-                chat_id=TUTOR_ID,
-                text=f"🎉 Ученик {student['full_name'] if student else 'Неизвестен'} выполнил ДЗ!\n\n"
-                     f"📝 {hw['task_text'][:100]}...\n"
-                     f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-            )
-        except:
-            pass
 
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            f"✅ Отлично! Вы выполнили задание:\n\n"
-            f"📝 {hw['task_text'][:200]}...\n\n"
-            f"Репетитор получил уведомление.",
-            reply_markup=get_student_main_keyboard()
+async def complete_homework(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отметить конкретное ДЗ как выполненное"""
+    query = update.callback_query
+    await query.answer()
+
+    hw_id = int(query.data.split(':')[1])
+    user_id = update.effective_user.id
+
+    # Находим ДЗ
+    hw = next((h for h in homeworks_db if h['id'] == hw_id and h['student_id'] == user_id), None)
+
+    if not hw:
+        await query.edit_message_text("❌ ДЗ не найдено.", reply_markup=get_student_main_keyboard())
+        return
+
+    # Отмечаем как выполненное
+    hw['is_completed'] = True
+    hw['completed_at'] = datetime.now(utc).isoformat()
+
+    # Проверяем, было ли ДЗ сдано вовремя
+    deadline = datetime.fromisoformat(hw['deadline']).astimezone(utc)
+    now = datetime.now(utc)
+    is_early = deadline > now
+
+    student = get_user(user_id)
+    tutor = get_user(hw['tutor_id'])
+
+    # Начисляем/снимаем жизни
+    lives_change = 0
+    if settings_db['lives_system']['enabled']:
+        if is_early:
+            # Награда за досрочное выполнение
+            reward = settings_db['lives_system']['reward_for_early_hw']
+            new_lives = update_lives(user_id, reward)
+            lives_change = reward
+        else:
+            # Штраф уже был снят при просрочке
+            lives_change = 0
+
+    # Уведомляем репетитора
+    if tutor:
+        time_status = "досрочно" if is_early else "с опозданием"
+        await application.bot.send_message(
+            chat_id=tutor['telegram_id'],
+            text=f"🎉 {student['full_name']} выполнил ДЗ {time_status}!\n\n"
+                 f"📝 {hw['task_text'][:100]}...\n"
+                 f"{'❤️ +' + str(lives_change) if lives_change > 0 else ''}"
         )
+
+    # Формируем ответ ученику
+    response = f"✅ ДЗ отмечено как выполненное!\n\n"
+    if is_early:
+        response += f"🎉 Вы сдали работу досрочно!\n"
+        if lives_change > 0:
+            response += f"❤️ +{lives_change} жизней\n"
+    else:
+        response += f"⚠️ Вы сдали работу с опозданием\n"
+
+    if student:
+        response += f"\n❤️ Ваши жизни: {student.get('lives', 0)}/{settings_db['lives_system']['max_lives']}"
+
+    await query.edit_message_text(response, reply_markup=get_student_main_keyboard())
 
 
 async def student_my_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Мои ДЗ"""
-    global last_activity
-    last_activity = datetime.now()
-
     user_id = update.effective_user.id
+    student_hws = [h for h in homeworks_db if h['student_id'] == user_id]
 
-    all_hws = [h for h in homeworks_db if h['student_id'] == user_id]
-    active_hws = [h for h in all_hws if not h.get('is_completed')]
-    completed_hws = [h for h in all_hws if h.get('is_completed')]
+    student = get_user(user_id)
+    student_tz = student.get('timezone', settings_db['timezone']) if student else settings_db['timezone']
 
-    if update.callback_query:
-        await update.callback_query.answer()
-        query = update.callback_query
+    if not student_hws:
+        text = "📭 У вас нет ДЗ."
     else:
-        query = None
+        active = [h for h in student_hws if not h.get('is_completed')]
+        completed = [h for h in student_hws if h.get('is_completed')]
 
-    if not active_hws and not completed_hws:
-        text = "📭 У вас нет домашних заданий."
-    else:
-        text = "📚 Ваши домашние задания:\n\n"
+        text = f"📚 Ваши ДЗ\n\n"
+        text += f"❤️ Ваши жизни: {student.get('lives', 0)}/{settings_db['lives_system']['max_lives']}\n\n"
 
-        if active_hws:
+        if active:
             text += "⏳ Активные:\n"
-            for hw in active_hws[:5]:  # Показываем первые 5
-                text += f"• {hw['task_text'][:50]}...\n"
-                text += f"  📅 Дедлайн: {format_datetime(hw['deadline'])}\n\n"
+            for hw in active[:3]:
+                deadline_str = get_local_time(hw['deadline'], student_tz)
+                text += f"• {hw['task_text'][:40]}...\n"
+                text += f"  📅 {deadline_str}\n\n"
 
-        if completed_hws:
+        if completed:
             text += "✅ Выполненные:\n"
-            for hw in completed_hws[-3:]:  # Показываем последние 3
-                completed_at = format_datetime(hw.get('completed_at', ''))
-                text += f"• {hw['task_text'][:50]}...\n"
-                text += f"  🏁 Выполнено: {completed_at}\n\n"
+            for hw in completed[-3:]:
+                completed_at = get_local_time(hw.get('completed_at'), student_tz)
+                text += f"• {hw['task_text'][:40]}...\n"
+                text += f"  🏁 {completed_at}\n\n"
 
-    if query:
-        await query.edit_message_text(text, reply_markup=get_student_main_keyboard())
-    else:
-        await update.message.reply_text(text, reply_markup=get_student_main_keyboard())
+    await update.callback_query.edit_message_text(text, reply_markup=get_student_main_keyboard())
 
 
 async def student_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Мое расписание"""
-    global last_activity
-    last_activity = datetime.now()
-
+    """Расписание"""
     user_id = update.effective_user.id
+    student_lessons = [l for l in lessons_db if
+                       l['student_id'] == user_id and l['lesson_time'] > datetime.now(utc).isoformat()]
 
-    student_lessons = [l for l in lessons_db if l['student_id'] == user_id]
-    upcoming_lessons = [l for l in student_lessons if l['lesson_time'] > datetime.now().isoformat()]
-    past_lessons = [l for l in student_lessons if l['lesson_time'] <= datetime.now().isoformat()]
+    student = get_user(user_id)
+    student_tz = student.get('timezone', settings_db['timezone']) if student else settings_db['timezone']
 
-    if update.callback_query:
-        await update.callback_query.answer()
-        query = update.callback_query
-    else:
-        query = None
-
-    if not upcoming_lessons and not past_lessons:
-        text = "🗓 У вас нет запланированных занятий."
+    if not student_lessons:
+        text = "🗓 Нет предстоящих занятий."
     else:
         text = "🗓 Ваше расписание:\n\n"
+        for lesson in student_lessons[:5]:
+            lesson_time = get_local_time(lesson['lesson_time'], student_tz)
+            text += f"📅 {lesson_time}\n"
+            text += f"📌 {lesson.get('topic', 'Без темы')}\n"
+            text += f"{'🔔' if lesson.get('notify_student', True) else '🔕'} Уведомления\n\n"
 
-        if upcoming_lessons:
-            text += "📅 Предстоящие:\n"
-            for lesson in upcoming_lessons[:5]:  # Показываем первые 5
-                text += f"• {format_datetime(lesson['lesson_time'])}\n"
-                text += f"  📌 {lesson.get('topic', 'Без темы')}\n"
-                text += f"  🔔 {'Уведомление включено' if lesson.get('notify_student', True) else 'Уведомление выключено'}\n\n"
+    await update.callback_query.edit_message_text(text, reply_markup=get_student_main_keyboard())
 
-        if past_lessons:
-            text += "📜 Прошедшие:\n"
-            for lesson in past_lessons[-3:]:  # Показываем последние 3
-                text += f"• {format_datetime(lesson['lesson_time'])}\n"
-                text += f"  📌 {lesson.get('topic', 'Без темы')}\n\n"
 
-    if query:
-        await query.edit_message_text(text, reply_markup=get_student_main_keyboard())
-    else:
-        await update.message.reply_text(text, reply_markup=get_student_main_keyboard())
+async def student_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Профиль ученика"""
+    user_id = update.effective_user.id
+    student = get_user(user_id)
+
+    if not student:
+        await update.callback_query.edit_message_text("❌ Профиль не найден.", reply_markup=get_student_main_keyboard())
+        return
+
+    student_tz = student.get('timezone', settings_db['timezone'])
+    active_hws = len(get_homeworks_for_student(user_id))
+    completed_hws = len([h for h in homeworks_db if h['student_id'] == user_id and h.get('is_completed')])
+
+    # Следующий сброс жизней
+    next_reset = "Не настроено"
+    if settings_db['lives_system']['enabled'] and student.get('last_life_reset'):
+        try:
+            last_reset = datetime.fromisoformat(student['last_life_reset']).astimezone(utc)
+            next_reset_date = last_reset + timedelta(days=settings_db['lives_system']['auto_reset_days'])
+            next_reset = get_local_time(next_reset_date.isoformat(), student_tz)
+        except:
+            pass
+
+    text = f"👤 Ваш профиль\n\n"
+    text += f"📝 Имя: {student['full_name']}\n"
+    text += f"🆔 ID: {user_id}\n"
+    text += f"🕐 Таймзона: {student_tz}\n"
+    text += f"📅 Зарегистрирован: {get_local_time(student['created_at'], student_tz)}\n\n"
+
+    text += f"📊 Статистика:\n"
+    text += f"• Активных ДЗ: {active_hws}\n"
+    text += f"• Выполнено ДЗ: {completed_hws}\n\n"
+
+    if settings_db['lives_system']['enabled']:
+        text += f"❤️ Система жизней:\n"
+        text += f"• Текущие жизни: {student.get('lives', 0)}/{settings_db['lives_system']['max_lives']}\n"
+        text += f"• Следующий сброс: {next_reset}\n\n"
+
+    text += f"🕐 Текущее время: {get_local_time(None, student_tz)}"
+
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить профиль", callback_data="student_profile")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
+    ]
+
+    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Справка"""
-    global last_activity
-    last_activity = datetime.now()
-
+    """Помощь"""
     help_text = """
-📚 HelperTutor - Бот-помощник репетитора
+📚 HelperTutor - Умный бот-помощник репетитора
 
-👨‍🏫 Для репетитора:
-/menu - Панель управления
-• Добавление ДЗ и занятий
-• Просмотр учеников
-• Управление напоминаниями
+👨‍🏫 Для репетитора (/menu):
+• 📝 Добавление ДЗ с учетом таймзоны ученика
+• 👥 Управление учениками (удаление)
+• ⚙️ Настройки системы (уведомления, жизни, время)
+• 📊 Статистика и мониторинг
 
 👨‍🎓 Для учеников:
-• ✅ ДЗ выполнено - отметка выполнения
-• 📚 Мои ДЗ - список заданий
-• 🗓 Расписание - занятия
+• ✅ Отметка выполнения ДЗ с системой жизней
+• 📚 Просмотр своих ДЗ и дедлайнов
+• 🗓 Расписание занятий
+• 👤 Профиль с информацией о жизнях
 
-🔔 Функции:
-• Автоматические напоминания
+❤️ Система жизней:
+• Жизни отнимаются за просроченные ДЗ
+• Начисляются за досрочное выполнение
+• Автоматически сбрасываются раз в неделю
+
+🕐 Умное время:
+• Поддержка всех таймзон
+• Автоматическая конвертация времени
+• Напоминания в локальном времени
+
+🔔 Уведомления:
+• Настраиваемые напоминания
+• Оповещения о просрочках
 • Уведомления репетитору
-• История заданий
-• Управление расписанием
 
-💡 Совет: Регулярно проверяйте ДЗ и расписание!
+💡 Совет: Устанавливайте реалистичные дедлайны!
 """
-
     if update.message:
         await update.message.reply_text(help_text)
-    elif update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(help_text)
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статус бота"""
-    global last_activity
-    last_activity = datetime.now()
-
-    status_text = f"""
-📊 Статус бота HelperTutor
-
-🔄 Бот работает
-⏱ Аптайм: {str(datetime.now() - start_time).split('.')[0]}
-📅 Запущен: {start_time.strftime('%d.%m.%Y %H:%M:%S')}
-👤 Пользователей: {len(users_db)}
-📝 ДЗ: {len(homeworks_db)} ({len([h for h in homeworks_db if not h.get('is_completed')])} активных)
-🗓 Занятий: {len(lessons_db)}
-🔔 Напоминаний: {len(scheduler.get_jobs()) if scheduler else 0}
-🌐 Порт: {PORT}
-"""
-    await update.message.reply_text(status_text)
+    else:
+        await update.callback_query.edit_message_text(help_text, reply_markup=get_student_main_keyboard())
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отмена"""
-    global last_activity
-    last_activity = datetime.now()
-
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            "❌ Действие отменено.",
-            reply_markup=get_tutor_main_keyboard() if is_tutor(update.callback_query.from_user.id)
-            else get_student_main_keyboard()
-        )
-    elif update.message:
-        await update.message.reply_text(
-            "❌ Действие отменено.",
-            reply_markup=get_tutor_main_keyboard() if is_tutor(update.effective_user.id)
-            else get_student_main_keyboard()
-        )
-
     context.user_data.clear()
+    user_id = update.effective_user.id
+    if update.callback_query:
+        if is_tutor(user_id):
+            await update.callback_query.edit_message_text("❌ Действие отменено.",
+                                                          reply_markup=get_tutor_main_keyboard())
+        else:
+            await update.callback_query.edit_message_text("❌ Действие отменено.",
+                                                          reply_markup=get_student_main_keyboard())
     return ConversationHandler.END
 
 
-async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик неизвестных сообщений"""
-    global last_activity
-    last_activity = datetime.now()
+async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат в главное меню"""
+    user_id = update.effective_user.id
+    if is_tutor(user_id):
+        await menu(update, context)
+    else:
+        keyboard = get_student_main_keyboard()
+        await update.callback_query.edit_message_text(
+            "Главное меню ученика:",
+            reply_markup=keyboard
+        )
 
-    if update.message:
-        user_id = update.effective_user.id
-        if is_tutor(user_id):
-            await update.message.reply_text(
-                "Используйте /menu для управления.",
-                reply_markup=get_tutor_main_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                "Используйте кнопки ниже:",
-                reply_markup=get_student_main_keyboard()
-            )
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+
+    if "Conflict" in str(context.error) and "getUpdates" in str(context.error):
+        logger.error("Обнаружен конфликт! Возможно запущено несколько ботов.")
+
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text("⚠️ Произошла ошибка. Пожалуйста, попробуйте позже.")
+    except:
+        pass
 
 
 # ====================== КЛАВИАТУРЫ ======================
 def get_tutor_main_keyboard():
-    """Основная клавиатура репетитора"""
     keyboard = [
         [InlineKeyboardButton("📝 Добавить ДЗ", callback_data='tutor_add_hw')],
         [InlineKeyboardButton("📋 Список ДЗ", callback_data='tutor_list_hw')],
-        [InlineKeyboardButton("📅 Добавить занятие", callback_data='tutor_add_lesson')],
-        [InlineKeyboardButton("🗓 Расписание", callback_data='tutor_list_lessons')],
         [InlineKeyboardButton("👥 Ученики", callback_data='tutor_list_students')],
-        [InlineKeyboardButton("🔄 Обновить напоминания", callback_data='tutor_reminders')],
+        [InlineKeyboardButton("🗑 Удалить ученика", callback_data='tutor_delete_student')],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data='tutor_settings')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='tutor_stats')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help')],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
 def get_student_main_keyboard():
-    """Основная клавиатура ученика"""
     keyboard = [
         [InlineKeyboardButton("✅ ДЗ выполнено", callback_data='student_hw_done')],
         [InlineKeyboardButton("📚 Мои ДЗ", callback_data='student_my_hw')],
         [InlineKeyboardButton("🗓 Расписание", callback_data='student_schedule')],
+        [InlineKeyboardButton("👤 Мой профиль", callback_data='student_profile')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help')],
     ]
     return InlineKeyboardMarkup(keyboard)
-
-
-# ====================== ОБРАБОТЧИКИ ОШИБОК ======================
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    logger.error(f"Ошибка: {context.error}", exc_info=context.error)
-
-    # Обработка конфликта (когда запущено несколько ботов)
-    if "Conflict" in str(context.error) and "getUpdates" in str(context.error):
-        logger.error("⚠️ Обнаружен конфликт! Возможно запущено несколько экземпляров бота.")
-
-    # Отправляем сообщение пользователю при ошибке
-    try:
-        if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "⚠️ Произошла ошибка. Пожалуйста, попробуйте позже или обратитесь к администратору."
-            )
-    except:
-        pass
-
-
-# ====================== ЗАПУСК БОТА ======================
-async def start_bot_async():
-    """Асинхронный запуск бота"""
-    global application, scheduler
-
-    try:
-        # Создаем приложение
-        application = Application.builder().token(TOKEN).build()
-
-        # Добавляем обработчик ошибок
-        application.add_error_handler(error_handler)
-
-        # Создаем планировщик
-        scheduler = AsyncIOScheduler(timezone=timezone(TIMEZONE))
-        scheduler.start()
-
-        # Conversation Handler для добавления ДЗ
-        conv_hw_handler = ConversationHandler(
-            entry_points=[CallbackQueryHandler(tutor_select_student_hw, pattern='^select_student_hw:')],
-            states={
-                WAITING_HW_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_hw_text)],
-                WAITING_HW_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_hw_deadline)],
-            },
-            fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$')],
-        )
-
-        # Conversation Handler для добавления занятия
-        conv_lesson_handler = ConversationHandler(
-            entry_points=[CallbackQueryHandler(tutor_select_student_lesson, pattern='^select_student_lesson:')],
-            states={
-                WAITING_LESSON_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_lesson_time)],
-                WAITING_LESSON_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_lesson_topic)],
-            },
-            fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$')],
-        )
-
-        # Регистрируем обработчики
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("menu", menu))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("status", status_command))
-
-        # Обработчики кнопок репетитора
-        application.add_handler(CallbackQueryHandler(tutor_add_hw_start, pattern='^tutor_add_hw$'))
-        application.add_handler(CallbackQueryHandler(tutor_list_hw, pattern='^tutor_list_hw$'))
-        application.add_handler(CallbackQueryHandler(tutor_add_lesson_start, pattern='^tutor_add_lesson$'))
-        application.add_handler(CallbackQueryHandler(tutor_list_lessons, pattern='^tutor_list_lessons$'))
-        application.add_handler(CallbackQueryHandler(tutor_list_students, pattern='^tutor_list_students$'))
-        application.add_handler(CallbackQueryHandler(tutor_reminders, pattern='^tutor_reminders$'))
-
-        # Обработчики кнопок ученика
-        application.add_handler(CallbackQueryHandler(student_hw_done, pattern='^student_hw_done$'))
-        application.add_handler(CallbackQueryHandler(student_my_hw, pattern='^student_my_hw$'))
-        application.add_handler(CallbackQueryHandler(student_schedule, pattern='^student_schedule$'))
-
-        # Conversation handlers
-        application.add_handler(conv_hw_handler)
-        application.add_handler(conv_lesson_handler)
-
-        # Общий обработчик кнопок
-        application.add_handler(CallbackQueryHandler(help_command, pattern='^help$'))
-        application.add_handler(CallbackQueryHandler(cancel, pattern='^cancel$'))
-
-        # Обработчик неизвестных сообщений
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
-
-        logger.info("✅ Обработчики зарегистрированы")
-
-        # Запускаем планировщик напоминаний
-        schedule_reminders()
-        logger.info("✅ Планировщик запущен")
-
-        logger.info("🤖 Бот запускается...")
-
-        # Запускаем бота
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
-
-        logger.info("✅ Бот успешно запущен!")
-        logger.info("👉 Напишите боту /start в Telegram")
-
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ Ошибка запуска бота: {e}", exc_info=True)
-        return False
 
 
 # ====================== GRACEFUL SHUTDOWN ======================
@@ -1349,7 +1320,7 @@ def shutdown_handler(signum=None, frame=None):
     """Обработчик завершения работы"""
     logger.info("🚫 Получен сигнал завершения...")
 
-    global application, scheduler, web_server_thread
+    global scheduler, application, web_runner
 
     # Останавливаем планировщик
     if scheduler and scheduler.running:
@@ -1359,16 +1330,22 @@ def shutdown_handler(signum=None, frame=None):
     # Останавливаем бота
     if application:
         try:
-            # Останавливаем polling
-            if application.updater and application.updater.running:
-                application.updater.stop()
-
-            # Останавливаем application
             application.stop()
             application.shutdown()
             logger.info("✅ Бот остановлен")
-        except Exception as e:
-            logger.error(f"❌ Ошибка при остановке бота: {e}")
+        except:
+            pass
+
+    # Останавливаем веб-сервер
+    if HAS_AIOHTTP and web_runner:
+        import asyncio as async_lib
+        try:
+            loop = async_lib.new_event_loop()
+            async_lib.set_event_loop(loop)
+            loop.run_until_complete(web_runner.cleanup())
+            logger.info("✅ Веб-сервер остановлен")
+        except:
+            pass
 
     logger.info("👋 Бот завершил работу")
     sys.exit(0)
@@ -1388,18 +1365,14 @@ def register_shutdown_handlers():
 
 
 # ====================== ОСНОВНАЯ ФУНКЦИЯ ======================
-start_time = datetime.now()
-
-
 async def main_async():
     """Асинхронная основная функция"""
-    global web_server_thread
+    global application, scheduler
 
-    logger.info("=" * 60)
-    logger.info("🚀 ЗАПУСК HELPER TUTOR BOT")
-    logger.info("=" * 60)
+    logger.info("=" * 50)
+    logger.info("🚀 ЗАПУСК HELPER TUTOR BOT v2.0")
+    logger.info("=" * 50)
 
-    # Проверка токена
     if not TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
         logger.info("💡 Добавьте на Render: TELEGRAM_BOT_TOKEN = ваш_токен")
@@ -1407,41 +1380,140 @@ async def main_async():
 
     logger.info(f"✅ Токен: установлен")
     logger.info(f"✅ Репетитор ID: {TUTOR_ID if TUTOR_ID else 'не установлен'}")
-    logger.info(f"✅ Временная зона: {TIMEZONE}")
+    logger.info(f"✅ Порт: {PORT}")
+    logger.info(f"✅ Таймзона: {settings_db['timezone']}")
+    logger.info(f"✅ Система жизней: {'Включена' if settings_db['lives_system']['enabled'] else 'Выключена'}")
 
-    # Запускаем веб-сервер в отдельном потоке
-    if HAS_AIOHTTP:
-        # Используем aiohttp
-        web_server_task = asyncio.create_task(start_web_server_aiohttp())
-    else:
-        # Используем простой HTTP сервер в отдельном потоке
-        web_server_thread = threading.Thread(target=run_http_server, daemon=True)
-        web_server_thread.start()
-        logger.info("🌐 HTTP сервер запущен в отдельном потоке")
+    # Запускаем веб-сервер для health checks
+    await start_web_server()
 
-    # Ждем немного чтобы сервер успел запуститься
-    await asyncio.sleep(2)
-
-    # Запускаем авто-пинг систему
-    start_auto_ping()
-
-    # Запускаем бота
-    bot_started = await start_bot_async()
-
-    if not bot_started:
-        logger.error("❌ Не удалось запустить бота")
-        return
-
-    logger.info(f"🌐 Health check доступен по адресу: http://0.0.0.0:{PORT}/health")
-    logger.info(f"📊 Статус доступен по адресу: http://0.0.0.0:{PORT}/status")
-    logger.info("⏰ Для предотвращения засыпания используйте внешний пинг сервис")
-
-    # Бесконечный цикл чтобы приложение не завершалось
     try:
+        # Создаем приложение Telegram
+        application = Application.builder().token(TOKEN).build()
+
+        # Добавляем обработчик ошибок
+        application.add_error_handler(error_handler)
+
+        # Создаем планировщик
+        scheduler = AsyncIOScheduler(timezone=timezone(settings_db['timezone']))
+        scheduler.start()
+
+        # Conversation Handler для ДЗ
+        conv_hw_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(tutor_select_student_hw, pattern='^hw_student:')],
+            states={
+                WAITING_HW_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_hw_text)],
+                WAITING_HW_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, tutor_hw_deadline)],
+            },
+            fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$')],
+        )
+
+        # Conversation Handler для удаления учеников
+        conv_delete_student = ConversationHandler(
+            entry_points=[CallbackQueryHandler(tutor_delete_student_confirm, pattern='^delete_student:')],
+            states={},
+            fallbacks=[
+                CallbackQueryHandler(tutor_delete_student_execute, pattern='^confirm_delete:'),
+                CallbackQueryHandler(cancel, pattern='^cancel$')
+            ],
+        )
+
+        # Conversation Handler для настроек
+        conv_settings = ConversationHandler(
+            entry_points=[CallbackQueryHandler(tutor_settings_start, pattern='^tutor_settings$')],
+            states={
+                WAITING_SETTINGS_CHOICE: [
+                    CallbackQueryHandler(tutor_settings_notifications, pattern='^settings_notifications$'),
+                    CallbackQueryHandler(tutor_settings_lives, pattern='^settings_lives$'),
+                    CallbackQueryHandler(tutor_settings_time, pattern='^settings_time$'),
+                    CallbackQueryHandler(back_to_main, pattern='^cancel$'),
+                    CallbackQueryHandler(tutor_stats, pattern='^settings_stats$'),
+                ],
+                WAITING_NOTIFICATION_SETTINGS: [
+                    CallbackQueryHandler(toggle_notification_setting, pattern='^toggle_.*'),
+                    CallbackQueryHandler(tutor_settings_start, pattern='^settings_back$'),
+                ],
+                WAITING_LIVES_SETTINGS: [
+                    CallbackQueryHandler(toggle_lives_system, pattern='^toggle_lives_system$'),
+                    CallbackQueryHandler(tutor_settings_start, pattern='^settings_back$'),
+                ],
+                WAITING_TIMEZONE_SETTINGS: [
+                    CallbackQueryHandler(set_timezone, pattern='^timezone:'),
+                    CallbackQueryHandler(tutor_settings_start, pattern='^settings_back$'),
+                ],
+            },
+            fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$')],
+        )
+
+        # Регистрируем обработчики команд
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("menu", menu))
+        application.add_handler(CommandHandler("help", help_command))
+
+        # Обработчики кнопок репетитора
+        application.add_handler(CallbackQueryHandler(tutor_add_hw_start, pattern='^tutor_add_hw$'))
+        application.add_handler(CallbackQueryHandler(tutor_list_hw, pattern='^tutor_list_hw$'))
+        application.add_handler(CallbackQueryHandler(tutor_list_students, pattern='^tutor_list_students$'))
+        application.add_handler(CallbackQueryHandler(tutor_delete_student_start, pattern='^tutor_delete_student$'))
+        application.add_handler(CallbackQueryHandler(tutor_stats, pattern='^tutor_stats$'))
+
+        # Обработчики кнопок ученика
+        application.add_handler(CallbackQueryHandler(student_hw_done, pattern='^student_hw_done$'))
+        application.add_handler(CallbackQueryHandler(complete_homework, pattern='^complete_hw:'))
+        application.add_handler(CallbackQueryHandler(student_my_hw, pattern='^student_my_hw$'))
+        application.add_handler(CallbackQueryHandler(student_schedule, pattern='^student_schedule$'))
+        application.add_handler(CallbackQueryHandler(student_profile, pattern='^student_profile$'))
+
+        # Общие обработчики
+        application.add_handler(CallbackQueryHandler(help_command, pattern='^help$'))
+        application.add_handler(CallbackQueryHandler(cancel, pattern='^cancel$'))
+        application.add_handler(CallbackQueryHandler(back_to_main, pattern='^back_to_main$'))
+
+        # Conversation handlers
+        application.add_handler(conv_hw_handler)
+        application.add_handler(conv_delete_student)
+        application.add_handler(conv_settings)
+
+        logger.info("✅ Обработчики зарегистрированы")
+
+        # Обновляем напоминания
+        schedule_reminders()
+
+        logger.info("🤖 Бот запускается...")
+
+        # Запускаем бота
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+
+        logger.info("✅ Бот успешно запущен!")
+        logger.info(f"🕐 Текущее время: {get_local_time()}")
+        logger.info(f"👥 Зарегистрировано учеников: {len(get_students())}")
+        logger.info("👉 Напишите боту /start в Telegram")
+
+        # Бесконечный цикл чтобы приложение не завершалось
         while True:
             await asyncio.sleep(3600)  # Спим 1 час
+
     except asyncio.CancelledError:
         logger.info("🛑 Получен сигнал отмены")
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
+    finally:
+        # Останавливаем бота
+        if application:
+            try:
+                await application.updater.stop()
+                await application.stop()
+                await application.shutdown()
+                logger.info("✅ Бот остановлен")
+            except:
+                pass
+
+        # Останавливаем планировщик
+        if scheduler and scheduler.running:
+            scheduler.shutdown()
+            logger.info("✅ Планировщик остановлен")
 
 
 def main():
@@ -1457,7 +1529,7 @@ def main():
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
-        logger.info("👋 Бот завершен пользователем")
+        logger.info("👋 Бот завершен")
     except Exception as e:
         logger.error(f"❌ Фатальная ошибка: {e}")
 
