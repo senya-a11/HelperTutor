@@ -166,9 +166,19 @@ def get_active_homeworks():
 
 
 def get_late_homeworks():
-    now_utc = datetime.now(utc).isoformat()
-    return [h for h in homeworks_db if
-            h['deadline'] < now_utc and not h.get('is_completed') and not h.get('late_notified')]
+    now_utc = datetime.now(utc)
+    now_utc_str = now_utc.isoformat()
+    late_hws = []
+    for h in homeworks_db:
+        try:
+            deadline = datetime.fromisoformat(h['deadline'].replace('Z', '+00:00'))
+            if (deadline < now_utc and
+                not h.get('is_completed') and
+                not h.get('late_notified')):
+                late_hws.append(h)
+        except Exception as e:
+            logger.error(f"Ошибка проверки просрочки ДЗ {h.get('id')}: {e}")
+    return late_hws
 
 
 def get_upcoming_lessons():
@@ -176,7 +186,7 @@ def get_upcoming_lessons():
     return [l for l in lessons_db if l['lesson_time'] > now_utc]
 
 
-def update_lives(student_id, delta, reason=""):
+async def update_lives(student_id, delta, reason=""):
     student = get_user(student_id)
     if student and settings['lives']['enabled']:
         current_lives = student.get('lives', settings['lives']['max_lives'])
@@ -185,11 +195,9 @@ def update_lives(student_id, delta, reason=""):
 
         if delta != 0 and settings['lives']['show_to_student']:
             try:
-                asyncio.create_task(
-                    application.bot.send_message(
-                        chat_id=student_id,
-                        text=f"{'❤️' if delta > 0 else '💔'} {reason}\nОсталось жизней: {new_lives}/{settings['lives']['max_lives']}"
-                    )
+                await application.bot.send_message(
+                    chat_id=student_id,
+                    text=f"{'❤️' if delta > 0 else '💔'} {reason}\nОсталось жизней: {new_lives}/{settings['lives']['max_lives']}"
                 )
             except Exception as e:
                 logger.error(f"Ошибка отправки уведомления о жизнях: {e}")
@@ -232,7 +240,7 @@ def schedule_reminders():
     scheduler.remove_all_jobs()
     now_utc = datetime.now(utc)
 
-    scheduler.add_job(check_late_homeworks, 'interval', hours=6, id='check_late_homeworks')
+    scheduler.add_job(check_late_homeworks, 'interval', hours=1, id='check_late_homeworks')
     scheduler.add_job(check_and_reset_lives, 'interval', hours=24, id='reset_lives_check')
 
     if settings['notifications']['homework_reminders']:
@@ -310,7 +318,7 @@ async def check_late_homeworks():
 
             if settings['lives']['enabled']:
                 penalty = settings['lives']['penalty_late']
-                new_lives = update_lives(student['telegram_id'], -penalty, f"Снято {penalty}❤️ за просрочку ДЗ")
+                new_lives = await update_lives(student['telegram_id'], -penalty, f"Снято {penalty}❤️ за просрочку ДЗ")
 
                 await application.bot.send_message(
                     chat_id=tutor['telegram_id'],
@@ -366,10 +374,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         role = 'student'
         student = get_user(user_id)
-        lives_text = f"❤️ Ваши жизни: {student.get('lives', settings['lives']['max_lives'])}/{settings['lives']['max_lives']}" if student and \
-                                                                                                                                  settings[
-                                                                                                                                      'lives'][
-                                                                                                                                      'enabled'] else ""
+        lives_text = f"❤️ Ваши жизни: {student.get('lives', settings['lives']['max_lives'])}/{settings['lives']['max_lives']}" if student and settings['lives']['enabled'] else ""
 
         welcome_text = f"""
 👨‍🎓 Привет, {user.full_name}!
@@ -720,9 +725,22 @@ async def tutor_add_hw_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     students = get_students()
     if not students:
         if update.callback_query:
-            await update.callback_query.edit_message_text("Нет учеников.", reply_markup=get_tutor_main_keyboard())
+            try:
+                await update.callback_query.edit_message_text(
+                    "Нет учеников. Добавьте учеников через /start",
+                    reply_markup=get_tutor_main_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при редактировании сообщения: {e}")
+                await update.callback_query.message.reply_text(
+                    "Нет учеников. Добавьте учеников через /start",
+                    reply_markup=get_tutor_main_keyboard()
+                )
         else:
-            await update.message.reply_text("Нет учеников.", reply_markup=get_tutor_main_keyboard())
+            await update.message.reply_text(
+                "Нет учеников. Добавьте учеников через /start",
+                reply_markup=get_tutor_main_keyboard()
+            )
         return ConversationHandler.END
 
     keyboard = [[InlineKeyboardButton(f"👤 {s['full_name']} ({s.get('lives', 0)}❤️)",
@@ -731,10 +749,17 @@ async def tutor_add_hw_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            "Выберите ученика для ДЗ:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        try:
+            await update.callback_query.edit_message_text(
+                "Выберите ученика для ДЗ:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await update.callback_query.message.reply_text(
+                "Выберите ученика для ДЗ:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
     else:
         await update.message.reply_text(
             "Выберите ученика для ДЗ:",
@@ -756,9 +781,22 @@ async def tutor_add_lesson_start(update: Update, context: ContextTypes.DEFAULT_T
     students = get_students()
     if not students:
         if update.callback_query:
-            await update.callback_query.edit_message_text("Нет учеников.", reply_markup=get_tutor_main_keyboard())
+            try:
+                await update.callback_query.edit_message_text(
+                    "Нет учеников. Добавьте учеников через /start",
+                    reply_markup=get_tutor_main_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при редактировании сообщения: {e}")
+                await update.callback_query.message.reply_text(
+                    "Нет учеников. Добавьте учеников через /start",
+                    reply_markup=get_tutor_main_keyboard()
+                )
         else:
-            await update.message.reply_text("Нет учеников.", reply_markup=get_tutor_main_keyboard())
+            await update.message.reply_text(
+                "Нет учеников. Добавьте учеников через /start",
+                reply_markup=get_tutor_main_keyboard()
+            )
         return ConversationHandler.END
 
     keyboard = [[InlineKeyboardButton(f"👤 {s['full_name']}", callback_data=f"lesson_student:{s['telegram_id']}")]
@@ -766,10 +804,17 @@ async def tutor_add_lesson_start(update: Update, context: ContextTypes.DEFAULT_T
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            "Выберите ученика для занятия:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        try:
+            await update.callback_query.edit_message_text(
+                "Выберите ученика для занятия:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await update.callback_query.message.reply_text(
+                "Выберите ученика для занятия:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
     else:
         await update.message.reply_text(
             "Выберите ученика для занятия:",
@@ -798,7 +843,11 @@ async def tutor_list_hw_callback(update: Update, context: ContextTypes.DEFAULT_T
             text += f"📅 {get_local_time(hw['deadline'], student_tz)}\n"
             text += f"⏰ Таймзона: {student_tz}\n\n"
 
-    await update.callback_query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
+    try:
+        await update.callback_query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await update.callback_query.message.reply_text(text, reply_markup=get_tutor_main_keyboard())
 
 
 async def tutor_list_students_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -822,7 +871,11 @@ async def tutor_list_students_callback(update: Update, context: ContextTypes.DEF
             text += f"  📊 ДЗ: {active_hws} активных, {completed_hws} выполнено\n"
             text += f"  🕐 Таймзона: {s.get('timezone', 'Не указана')}\n\n"
 
-    await update.callback_query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
+    try:
+        await update.callback_query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await update.callback_query.message.reply_text(text, reply_markup=get_tutor_main_keyboard())
 
 
 async def tutor_delete_student_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -838,9 +891,22 @@ async def tutor_delete_student_start(update: Update, context: ContextTypes.DEFAU
     students = get_students()
     if not students:
         if update.callback_query:
-            await update.callback_query.edit_message_text("Нет учеников.", reply_markup=get_tutor_main_keyboard())
+            try:
+                await update.callback_query.edit_message_text(
+                    "Нет учеников.",
+                    reply_markup=get_tutor_main_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при редактировании сообщения: {e}")
+                await update.callback_query.message.reply_text(
+                    "Нет учеников.",
+                    reply_markup=get_tutor_main_keyboard()
+                )
         else:
-            await update.message.reply_text("Нет учеников.", reply_markup=get_tutor_main_keyboard())
+            await update.message.reply_text(
+                "Нет учеников.",
+                reply_markup=get_tutor_main_keyboard()
+            )
         return
 
     keyboard = [[InlineKeyboardButton(f"🗑 {s['full_name']}", callback_data=f"delete_student:{s['telegram_id']}")]
@@ -848,10 +914,17 @@ async def tutor_delete_student_start(update: Update, context: ContextTypes.DEFAU
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            "Выберите ученика для удаления:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        try:
+            await update.callback_query.edit_message_text(
+                "Выберите ученика для удаления:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await update.callback_query.message.reply_text(
+                "Выберите ученика для удаления:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
     else:
         await update.message.reply_text(
             "Выберите ученика для удаления:",
@@ -874,13 +947,23 @@ async def tutor_settings_start_callback(update: Update, context: ContextTypes.DE
         [InlineKeyboardButton("⬅️ Назад", callback_data="cancel")]
     ]
 
-    await update.callback_query.edit_message_text(
-        f"⚙️ Настройки\n\n"
-        f"Таймзона: {settings['timezone']}\n"
-        f"Уведомления: {'✅' if settings['notifications']['homework_reminders'] else '❌'}\n"
-        f"Жизни: {'✅' if settings['lives']['enabled'] else '❌'}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await update.callback_query.edit_message_text(
+            f"⚙️ Настройки\n\n"
+            f"Таймзона: {settings['timezone']}\n"
+            f"Уведомления: {'✅' if settings['notifications']['homework_reminders'] else '❌'}\n"
+            f"Жизни: {'✅' if settings['lives']['enabled'] else '❌'}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await update.callback_query.message.reply_text(
+            f"⚙️ Настройки\n\n"
+            f"Таймзона: {settings['timezone']}\n"
+            f"Уведомления: {'✅' if settings['notifications']['homework_reminders'] else '❌'}\n"
+            f"Жизни: {'✅' if settings['lives']['enabled'] else '❌'}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     return WAITING_SETTINGS_CHOICE
 
 
@@ -915,7 +998,11 @@ async def tutor_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     text += f"🕐 Таймзона: {settings['timezone']}"
 
-    await update.callback_query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
+    try:
+        await update.callback_query.edit_message_text(text, reply_markup=get_tutor_main_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await update.callback_query.message.reply_text(text, reply_markup=get_tutor_main_keyboard())
 
 
 # ====================== ДОБАВЛЕНИЕ ДЗ ======================
@@ -930,10 +1017,17 @@ async def tutor_select_student_hw(update: Update, context: ContextTypes.DEFAULT_
     student_id = int(query.data.split(':')[1])
     context.user_data['selected_student'] = student_id
 
-    await query.edit_message_text(
-        "Введите текст ДЗ:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
-    )
+    try:
+        await query.edit_message_text(
+            "Введите текст ДЗ:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            "Введите текст ДЗ:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+        )
     return WAITING_HW_TEXT
 
 
@@ -1013,10 +1107,17 @@ async def tutor_select_student_lesson(update: Update, context: ContextTypes.DEFA
     student_id = int(query.data.split(':')[1])
     context.user_data['selected_student'] = student_id
 
-    await query.edit_message_text(
-        "Введите тему занятия:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
-    )
+    try:
+        await query.edit_message_text(
+            "Введите тему занятия:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            "Введите тему занятия:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+        )
     return WAITING_LESSON_TOPIC
 
 
@@ -1070,10 +1171,17 @@ async def tutor_lesson_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
-    await query.edit_message_text(
-        f"Выберите время начала занятия ({date_str}):",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.edit_message_text(
+            f"Выберите время начала занятия ({date_str}):",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            f"Выберите время начала занятия ({date_str}):",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     return WAITING_LESSON_HOUR
 
 
@@ -1093,10 +1201,17 @@ async def tutor_lesson_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
-    await query.edit_message_text(
-        "Выберите минуты:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.edit_message_text(
+            "Выберите минуты:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            "Выберите минуты:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     return WAITING_LESSON_MINUTE
 
 
@@ -1119,7 +1234,11 @@ async def tutor_lesson_minute(update: Update, context: ContextTypes.DEFAULT_TYPE
     lesson_time = parse_datetime(dt_str, student_tz)
 
     if not lesson_time:
-        await query.edit_message_text("Ошибка при создании времени занятия.", reply_markup=get_tutor_main_keyboard())
+        try:
+            await query.edit_message_text("Ошибка при создании времени занятия.", reply_markup=get_tutor_main_keyboard())
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await query.message.reply_text("Ошибка при создании времени занятия.", reply_markup=get_tutor_main_keyboard())
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -1147,14 +1266,25 @@ async def tutor_lesson_minute(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.error(f"Ошибка отправки уведомления ученику: {e}")
 
-    await query.edit_message_text(
-        f"✅ Занятие добавлено!\n\n"
-        f"👤 Ученик: {student['full_name'] if student else '???'}\n"
-        f"📌 Тема: {topic}\n"
-        f"🕐 Время: {get_local_time(lesson_time.isoformat(), student_tz)}\n"
-        f"⏰ Таймзона: {student_tz}",
-        reply_markup=get_tutor_main_keyboard()
-    )
+    try:
+        await query.edit_message_text(
+            f"✅ Занятие добавлено!\n\n"
+            f"👤 Ученик: {student['full_name'] if student else '???'}\n"
+            f"📌 Тема: {topic}\n"
+            f"🕐 Время: {get_local_time(lesson_time.isoformat(), student_tz)}\n"
+            f"⏰ Таймзона: {student_tz}",
+            reply_markup=get_tutor_main_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            f"✅ Занятие добавлено!\n\n"
+            f"👤 Ученик: {student['full_name'] if student else '???'}\n"
+            f"📌 Тема: {topic}\n"
+            f"🕐 Время: {get_local_time(lesson_time.isoformat(), student_tz)}\n"
+            f"⏰ Таймзона: {student_tz}",
+            reply_markup=get_tutor_main_keyboard()
+        )
 
     context.user_data.clear()
     schedule_reminders()
@@ -1191,10 +1321,17 @@ async def tutor_settings_notifications(update: Update, context: ContextTypes.DEF
         [InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")]
     ]
 
-    await query.edit_message_text(
-        "🔔 Настройки уведомлений:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.edit_message_text(
+            "🔔 Настройки уведомлений:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            "🔔 Настройки уведомлений:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     return WAITING_NOTIFICATION_SETTINGS
 
 
@@ -1239,10 +1376,17 @@ async def hw_notification_times(update: Update, context: ContextTypes.DEFAULT_TY
 
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_notifications")])
 
-    await query.edit_message_text(
-        "📚 Уведомления о ДЗ:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.edit_message_text(
+            "📚 Уведомления о ДЗ:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            "📚 Уведомления о ДЗ:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 
 async def lesson_notification_times(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1265,10 +1409,17 @@ async def lesson_notification_times(update: Update, context: ContextTypes.DEFAUL
 
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_notifications")])
 
-    await query.edit_message_text(
-        "🗓 Уведомления о занятиях:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.edit_message_text(
+            "🗓 Уведомления о занятиях:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            "🗓 Уведомления о занятиях:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 
 async def toggle_notification_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1342,10 +1493,17 @@ async def tutor_settings_lives(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")]
     ]
 
-    await query.edit_message_text(
-        "❤️ Настройки жизней:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.edit_message_text(
+            "❤️ Настройки жизней:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            "❤️ Настройки жизней:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     return WAITING_LIVES_SETTINGS
 
 
@@ -1385,11 +1543,19 @@ async def set_lives_value_start(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data['setting_to_change'] = setting_key
     context.user_data['setting_name'] = setting_name
 
-    await query.edit_message_text(
-        f"Введите новое значение для '{setting_name}':\n"
-        f"Текущее: {current_value}",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="settings_lives")]])
-    )
+    try:
+        await query.edit_message_text(
+            f"Введите новое значение для '{setting_name}':\n"
+            f"Текущее: {current_value}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="settings_lives")]])
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            f"Введите новое значение для '{setting_name}':\n"
+            f"Текущее: {current_value}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="settings_lives")]])
+        )
     return WAITING_LIVES_SETTINGS
 
 
@@ -1432,8 +1598,8 @@ async def tutor_settings_time(update: Update, context: ContextTypes.DEFAULT_TYPE
     popular_timezones = [
         'Europe/Moscow', 'Europe/Kaliningrad',
         'Asia/Yekaterinburg', 'Asia/Omsk',
-        'Asia/Vladivostok', 'Europe/Kiev',
-        'Europe/Minsk', 'Asia/Almaty'
+        'Asia/Vladivostok', 'Europe/Minsk',
+        'Asia/Almaty', 'Asia/Tashkent'
     ]
 
     keyboard = []
@@ -1446,12 +1612,21 @@ async def tutor_settings_time(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")])
 
-    await query.edit_message_text(
-        f"🕐 Настройки времени\n\n"
-        f"Текущая: {settings['timezone']}\n"
-        f"Время: {get_local_time()}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.edit_message_text(
+            f"🕐 Настройки времени\n\n"
+            f"Текущая: {settings['timezone']}\n"
+            f"Время: {get_local_time()}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            f"🕐 Настройки времени\n\n"
+            f"Текущая: {settings['timezone']}\n"
+            f"Время: {get_local_time()}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     return WAITING_TIMEZONE_SETTINGS
 
 
@@ -1467,11 +1642,19 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user.get('role') == 'student' and not user.get('timezone'):
             user['timezone'] = new_timezone
 
-    await query.edit_message_text(
-        f"✅ Таймзона: {new_timezone}\n"
-        f"🕐 Время: {get_local_time()}",
-        reply_markup=get_tutor_main_keyboard()
-    )
+    try:
+        await query.edit_message_text(
+            f"✅ Таймзона: {new_timezone}\n"
+            f"🕐 Время: {get_local_time()}",
+            reply_markup=get_tutor_main_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            f"✅ Таймзона: {new_timezone}\n"
+            f"🕐 Время: {get_local_time()}",
+            reply_markup=get_tutor_main_keyboard()
+        )
 
     schedule_reminders()
     return ConversationHandler.END
@@ -1487,7 +1670,11 @@ async def tutor_delete_student_confirm(update: Update, context: ContextTypes.DEF
     student = get_user(student_id)
 
     if not student:
-        await query.edit_message_text("❌ Ученик не найден.", reply_markup=get_tutor_main_keyboard())
+        try:
+            await query.edit_message_text("❌ Ученик не найден.", reply_markup=get_tutor_main_keyboard())
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await query.message.reply_text("❌ Ученик не найден.", reply_markup=get_tutor_main_keyboard())
         return ConversationHandler.END
 
     keyboard = [
@@ -1495,13 +1682,23 @@ async def tutor_delete_student_confirm(update: Update, context: ContextTypes.DEF
         [InlineKeyboardButton("❌ Нет", callback_data="cancel")]
     ]
 
-    await query.edit_message_text(
-        f"⚠️ Удалить ученика?\n\n"
-        f"👤 {student['full_name']}\n"
-        f"📊 ДЗ: {len(get_homeworks_for_student(student_id))}\n\n"
-        f"Все данные будут удалены!",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.edit_message_text(
+            f"⚠️ Удалить ученика?\n\n"
+            f"👤 {student['full_name']}\n"
+            f"📊 ДЗ: {len(get_homeworks_for_student(student_id))}\n\n"
+            f"Все данные будут удалены!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            f"⚠️ Удалить ученика?\n\n"
+            f"👤 {student['full_name']}\n"
+            f"📊 ДЗ: {len(get_homeworks_for_student(student_id))}\n\n"
+            f"Все данные будут удалены!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 
 async def tutor_delete_student_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1521,12 +1718,23 @@ async def tutor_delete_student_execute(update: Update, context: ContextTypes.DEF
         global lessons_db
         lessons_db = [l for l in lessons_db if l['student_id'] != student_id]
 
-        await query.edit_message_text(
-            f"✅ Ученик {student['full_name']} удален!",
-            reply_markup=get_tutor_main_keyboard()
-        )
+        try:
+            await query.edit_message_text(
+                f"✅ Ученик {student['full_name']} удален!",
+                reply_markup=get_tutor_main_keyboard()
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await query.message.reply_text(
+                f"✅ Ученик {student['full_name']} удален!",
+                reply_markup=get_tutor_main_keyboard()
+            )
     else:
-        await query.edit_message_text("❌ Ученик не найден.", reply_markup=get_tutor_main_keyboard())
+        try:
+            await query.edit_message_text("❌ Ученик не найден.", reply_markup=get_tutor_main_keyboard())
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await query.message.reply_text("❌ Ученик не найден.", reply_markup=get_tutor_main_keyboard())
 
     return ConversationHandler.END
 
@@ -1542,7 +1750,11 @@ async def student_hw_done_callback(update: Update, context: ContextTypes.DEFAULT
     student_hws = [h for h in homeworks_db if h['student_id'] == user_id and not h.get('is_completed')]
 
     if not student_hws:
-        await update.callback_query.edit_message_text("📭 Нет активных ДЗ.", reply_markup=get_student_main_keyboard())
+        try:
+            await update.callback_query.edit_message_text("📭 Нет активных ДЗ.", reply_markup=get_student_main_keyboard())
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await update.callback_query.message.reply_text("📭 Нет активных ДЗ.", reply_markup=get_student_main_keyboard())
         return
 
     keyboard = []
@@ -1562,13 +1774,19 @@ async def student_hw_done_callback(update: Update, context: ContextTypes.DEFAULT
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
     student = get_user(user_id)
-    lives_text = f"\n❤️ Жизни: {student.get('lives', 0)}/{settings['lives']['max_lives']}" if settings['lives'][
-        'enabled'] else ""
+    lives_text = f"\n❤️ Жизни: {student.get('lives', 0)}/{settings['lives']['max_lives']}" if settings['lives']['enabled'] else ""
 
-    await update.callback_query.edit_message_text(
-        f"📚 Выберите ДЗ:{lives_text}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await update.callback_query.edit_message_text(
+            f"📚 Выберите ДЗ:{lives_text}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await update.callback_query.message.reply_text(
+            f"📚 Выберите ДЗ:{lives_text}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 
 async def complete_homework(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1584,7 +1802,11 @@ async def complete_homework(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hw = next((h for h in homeworks_db if h['id'] == hw_id and h['student_id'] == user_id), None)
 
     if not hw:
-        await query.edit_message_text("❌ ДЗ не найдено.", reply_markup=get_student_main_keyboard())
+        try:
+            await query.edit_message_text("❌ ДЗ не найдено.", reply_markup=get_student_main_keyboard())
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await query.message.reply_text("❌ ДЗ не найдено.", reply_markup=get_student_main_keyboard())
         return
 
     hw['is_completed'] = True
@@ -1602,7 +1824,7 @@ async def complete_homework(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_early:
             reward = settings['lives']['reward_early']
             if reward > 0:
-                new_lives = update_lives(user_id, reward, f"Начислено {reward}❤️ за досрочное выполнение")
+                new_lives = await update_lives(user_id, reward, f"Начислено {reward}❤️ за досрочное выполнение")
                 lives_change = reward
 
     if tutor:
@@ -1624,7 +1846,11 @@ async def complete_homework(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if student and settings['lives']['enabled']:
         response += f"\n❤️ Жизни: {student.get('lives', 0)}/{settings['lives']['max_lives']}"
 
-    await query.edit_message_text(response, reply_markup=get_student_main_keyboard())
+    try:
+        await query.edit_message_text(response, reply_markup=get_student_main_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(response, reply_markup=get_student_main_keyboard())
 
 
 async def student_my_hw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1663,7 +1889,11 @@ async def student_my_hw_callback(update: Update, context: ContextTypes.DEFAULT_T
                 text += f"• {hw['task_text'][:40]}...\n"
                 text += f"  🏁 {completed_at}\n\n"
 
-    await update.callback_query.edit_message_text(text, reply_markup=get_student_main_keyboard())
+    try:
+        await update.callback_query.edit_message_text(text, reply_markup=get_student_main_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await update.callback_query.message.reply_text(text, reply_markup=get_student_main_keyboard())
 
 
 async def student_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1688,7 +1918,11 @@ async def student_schedule_callback(update: Update, context: ContextTypes.DEFAUL
             text += f"📅 {lesson_time}\n"
             text += f"📌 {lesson.get('topic', 'Без темы')}\n\n"
 
-    await update.callback_query.edit_message_text(text, reply_markup=get_student_main_keyboard())
+    try:
+        await update.callback_query.edit_message_text(text, reply_markup=get_student_main_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await update.callback_query.message.reply_text(text, reply_markup=get_student_main_keyboard())
 
 
 async def student_profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1701,7 +1935,11 @@ async def student_profile_callback(update: Update, context: ContextTypes.DEFAULT
     student = get_user(user_id)
 
     if not student:
-        await update.callback_query.edit_message_text("❌ Профиль не найден.", reply_markup=get_student_main_keyboard())
+        try:
+            await update.callback_query.edit_message_text("❌ Профиль не найден.", reply_markup=get_student_main_keyboard())
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            await update.callback_query.message.reply_text("❌ Профиль не найден.", reply_markup=get_student_main_keyboard())
         return
 
     active_hws = len(get_homeworks_for_student(user_id))
@@ -1736,7 +1974,11 @@ async def student_profile_callback(update: Update, context: ContextTypes.DEFAULT
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
     ]
 
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    try:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await update.callback_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 # ====================== ОБРАБОТЧИКИ ОТМЕНЫ ======================
@@ -1747,16 +1989,29 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.callback_query:
         await update.callback_query.answer()
-        if is_tutor(user_id):
-            await update.callback_query.edit_message_text(
-                "❌ Отменено",
-                reply_markup=get_tutor_main_keyboard()
-            )
-        else:
-            await update.callback_query.edit_message_text(
-                "❌ Отменено",
-                reply_markup=get_student_main_keyboard()
-            )
+        try:
+            if is_tutor(user_id):
+                await update.callback_query.edit_message_text(
+                    "❌ Отменено",
+                    reply_markup=get_tutor_main_keyboard()
+                )
+            else:
+                await update.callback_query.edit_message_text(
+                    "❌ Отменено",
+                    reply_markup=get_student_main_keyboard()
+                )
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            if is_tutor(user_id):
+                await update.callback_query.message.reply_text(
+                    "❌ Отменено",
+                    reply_markup=get_tutor_main_keyboard()
+                )
+            else:
+                await update.callback_query.message.reply_text(
+                    "❌ Отменено",
+                    reply_markup=get_student_main_keyboard()
+                )
     elif update.message:
         if is_tutor(user_id):
             await update.message.reply_text(
@@ -1779,16 +2034,29 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.callback_query:
         await update.callback_query.answer()
-        if is_tutor(user_id):
-            await update.callback_query.edit_message_text(
-                "📊 Панель управления:",
-                reply_markup=get_tutor_main_keyboard()
-            )
-        else:
-            await update.callback_query.edit_message_text(
-                "Главное меню:",
-                reply_markup=get_student_main_keyboard()
-            )
+        try:
+            if is_tutor(user_id):
+                await update.callback_query.edit_message_text(
+                    "📊 Панель управления:",
+                    reply_markup=get_tutor_main_keyboard()
+                )
+            else:
+                await update.callback_query.edit_message_text(
+                    "Главное меню:",
+                    reply_markup=get_student_main_keyboard()
+                )
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            if is_tutor(user_id):
+                await update.callback_query.message.reply_text(
+                    "📊 Панель управления:",
+                    reply_markup=get_tutor_main_keyboard()
+                )
+            else:
+                await update.callback_query.message.reply_text(
+                    "Главное меню:",
+                    reply_markup=get_student_main_keyboard()
+                )
     elif update.message:
         if is_tutor(user_id):
             await update.message.reply_text(
@@ -1819,13 +2087,23 @@ async def settings_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⬅️ Назад", callback_data="cancel")]
     ]
 
-    await query.edit_message_text(
-        f"⚙️ Настройки\n\n"
-        f"Таймзона: {settings['timezone']}\n"
-        f"Уведомления: {'✅' if settings['notifications']['homework_reminders'] else '❌'}\n"
-        f"Жизни: {'✅' if settings['lives']['enabled'] else '❌'}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await query.edit_message_text(
+            f"⚙️ Настройки\n\n"
+            f"Таймзона: {settings['timezone']}\n"
+            f"Уведомления: {'✅' if settings['notifications']['homework_reminders'] else '❌'}\n"
+            f"Жизни: {'✅' if settings['lives']['enabled'] else '❌'}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {e}")
+        await query.message.reply_text(
+            f"⚙️ Настройки\n\n"
+            f"Таймзона: {settings['timezone']}\n"
+            f"Уведомления: {'✅' if settings['notifications']['homework_reminders'] else '❌'}\n"
+            f"Жизни: {'✅' if settings['lives']['enabled'] else '❌'}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     return WAITING_SETTINGS_CHOICE
 
 
